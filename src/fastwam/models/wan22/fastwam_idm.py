@@ -236,6 +236,7 @@ class FastWAMIDM(FastWAMJoint):
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        input_action_image: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
@@ -245,6 +246,8 @@ class FastWAMIDM(FastWAMJoint):
         tiled: bool = False,
     ) -> dict[str, Any]:
         # Reuse infer_joint pipeline and keep infer_action output contract.
+        if input_action_image is not None:
+            raise ValueError("FastWAMIDM does not support input_action_image.")
         out = self.infer_joint(
             prompt=prompt,
             input_image=input_image,
@@ -276,6 +279,7 @@ class FastWAMIDM(FastWAMJoint):
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        input_action_image: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
@@ -287,6 +291,8 @@ class FastWAMIDM(FastWAMJoint):
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
+        if input_action_image is not None:
+            raise ValueError("FastWAMIDM does not support input_action_image.")
 
         if action is not None:
             logger.warning(

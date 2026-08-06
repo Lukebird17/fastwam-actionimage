@@ -37,6 +37,7 @@ from experiments.libero.libero_utils import (
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.utils.precision import mixed_precision_to_dtype
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
@@ -58,25 +59,6 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
-
-
-def _normalize_mixed_precision(mixed_precision: str) -> str:
-    key = str(mixed_precision).strip().lower()
-    if key not in {"no", "fp16", "bf16"}:
-        raise ValueError(
-            f"Unsupported mixed_precision: {mixed_precision}. "
-            "Expected one of: ['no', 'fp16', 'bf16']."
-        )
-    return key
-
-
-def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
-    precision = _normalize_mixed_precision(mixed_precision)
-    if precision == "no":
-        return torch.float32
-    if precision == "fp16":
-        return torch.float16
-    return torch.bfloat16
 
 
 def _resolve_eval_device(cfg: DictConfig) -> str:
@@ -696,7 +678,7 @@ def eval_single_process(cfg: DictConfig):
         )
 
     model_device = _resolve_eval_device(cfg)
-    model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
+    model_dtype = mixed_precision_to_dtype(cfg.get("mixed_precision", "bf16"))
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()

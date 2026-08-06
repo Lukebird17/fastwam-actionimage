@@ -3,9 +3,10 @@
 Head camera: true world→camera pinhole projection (no mount transform).
 
 Wrist cameras: use a calibrated rigid ``T_cam←ee`` matrix per side
-(``wrist_cam_from_ee['left'|'right']``).  Future EE motion is relative to the
-window-start EE and viewed along that mount baseline.  Left/right mounts are
-distinct so new embodiments only need to supply new 4×4 pairs.
+(``wrist_cam_from_ee['left'|'right']``). Future EE motion is relative to the
+window-start EE. The mount rotation is preserved, while its translation is
+recentered to put the initial EE at a positive virtual depth. Left/right mounts
+are distinct so new embodiments only need to supply new 4×4 pairs.
 """
 
 from __future__ import annotations
@@ -75,27 +76,6 @@ def widen_intrinsics(intrinsics: np.ndarray, scale: float, height: int, width: i
     return intrinsics
 
 
-def _look_at_world_to_camera(camera_center: np.ndarray) -> np.ndarray:
-    """OpenCV world-to-camera that sits at ``camera_center`` and looks at the origin."""
-    center = np.asarray(camera_center, dtype=np.float64).reshape(3)
-    distance = np.linalg.norm(center)
-    if distance < 1e-8:
-        raise ValueError("camera_center must be away from the origin")
-    z_axis = -center / distance
-    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    if abs(float(z_axis @ up)) > 0.9:
-        up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    x_axis = np.cross(up, z_axis)
-    x_axis /= np.linalg.norm(x_axis)
-    y_axis = np.cross(z_axis, x_axis)
-    rotation_c2w = np.stack((x_axis, y_axis, z_axis), axis=1)
-    rotation_w2c = rotation_c2w.T
-    matrix = np.eye(4, dtype=np.float64)
-    matrix[:3, :3] = rotation_w2c
-    matrix[:3, 3] = -rotation_w2c @ center
-    return matrix
-
-
 def project_points_camera_frame(
     points_camera: np.ndarray,
     intrinsics_cv: np.ndarray,
@@ -147,7 +127,7 @@ def _gaussian(points: np.ndarray, valid: np.ndarray, height: int, width: int, si
 
 def _render_from_camera_points(
     position_cam: np.ndarray,
-    forward_cam: np.ndarray,
+    normal_cam: np.ndarray,
     up_cam: np.ndarray,
     gripper: np.ndarray,
     intrinsics_cv: np.ndarray,
@@ -158,14 +138,14 @@ def _render_from_camera_points(
     position_2d, position_valid = project_points_camera_frame(
         position_cam, intrinsics_cv, height=height, width=width
     )
-    forward_2d, forward_valid = project_points_camera_frame(
-        forward_cam, intrinsics_cv, height=height, width=width
+    normal_2d, normal_valid = project_points_camera_frame(
+        normal_cam, intrinsics_cv, height=height, width=width
     )
     up_2d, up_valid = project_points_camera_frame(
         up_cam, intrinsics_cv, height=height, width=width
     )
     red = _gaussian(position_2d, position_valid, height, width, sigma)
-    green = _gaussian(forward_2d, forward_valid, height, width, sigma)
+    green = _gaussian(normal_2d, normal_valid, height, width, sigma)
     blue = _gaussian(up_2d, up_valid, height, width, sigma)
     gripper_floor = ((gripper > 0.5) & position_valid)[:, None, None] * 0.25
     blue = np.where(blue <= 0.25, gripper_floor, blue)
@@ -180,6 +160,7 @@ def render_arm_action_images(
     height: int,
     width: int,
     *,
+    ee_from_action_frame: np.ndarray,
     axis_length: float = 0.1,
     sigma: float = 0.05,
     fov_scale: float = 1.0,
@@ -191,19 +172,24 @@ def render_arm_action_images(
         raise ValueError(f"Expected poses [T, 7], got {poses.shape}")
     if gripper.shape != (poses.shape[0],):
         raise ValueError(f"Expected gripper [T], got {gripper.shape}")
+    ee_from_action = np.asarray(ee_from_action_frame, dtype=np.float32)
+    if ee_from_action.shape != (4, 4):
+        raise ValueError(f"ee_from_action_frame must be 4x4, got {ee_from_action.shape}")
 
-    rotation = quaternion_wxyz_to_matrix(poses[:, 3:7])
+    # Canonical Action Images axes are +X=normal (green), -Z=up (blue).
+    # Map them through this embodiment's action-frame calibration first.
+    rotation = quaternion_wxyz_to_matrix(poses[:, 3:7]) @ ee_from_action[:3, :3]
     position = poses[:, :3]
-    forward = position + rotation[..., :, 0] * axis_length
+    normal = position + rotation[..., :, 0] * axis_length
     up = position - rotation[..., :, 2] * axis_length
     intrinsics = widen_intrinsics(intrinsics_cv, fov_scale, height, width)
 
     extrinsic = np.asarray(world_to_camera_cv, dtype=np.float32)
     position_cam = np.einsum("ij,...j->...i", extrinsic[:, :3], position) + extrinsic[:, 3]
-    forward_cam = np.einsum("ij,...j->...i", extrinsic[:, :3], forward) + extrinsic[:, 3]
+    normal_cam = np.einsum("ij,...j->...i", extrinsic[:, :3], normal) + extrinsic[:, 3]
     up_cam = np.einsum("ij,...j->...i", extrinsic[:, :3], up) + extrinsic[:, 3]
     return _render_from_camera_points(
-        position_cam, forward_cam, up_cam, gripper, intrinsics, height, width, sigma
+        position_cam, normal_cam, up_cam, gripper, intrinsics, height, width, sigma
     )
 
 
@@ -211,6 +197,7 @@ def render_wrist_arm_action_images(
     poses_wxyz: np.ndarray,
     gripper: np.ndarray,
     cam_from_ee: np.ndarray,
+    ee_from_action_frame: np.ndarray,
     intrinsics_cv: np.ndarray,
     height: int,
     width: int,
@@ -223,54 +210,57 @@ def render_wrist_arm_action_images(
     """Render ipsilateral wrist action images with a calibrated ``T_cam←ee``.
 
     ``cam_from_ee`` is the rigid wrist mount (left and right are distinct matrices).
-    Future EE poses are expressed relative to the window-start EE, then viewed by a
-    virtual camera on that mount baseline looking at the EE.
+    Future EE poses are expressed relative to the window-start EE. The full mount
+    rotation maps those points into the wrist camera frame. Its physical translation
+    is replaced by ``[0, 0, wrist_look_distance]`` because RoboTwin's EE origin is
+    slightly behind the real wrist image plane; this keeps the initial position at
+    the principal point without discarding the calibrated camera/EE angular offset.
     """
     poses = np.asarray(poses_wxyz, dtype=np.float32)
     gripper = np.asarray(gripper, dtype=np.float32)
     cam_from_ee = np.asarray(cam_from_ee, dtype=np.float64)
+    ee_from_action = np.asarray(ee_from_action_frame, dtype=np.float64)
     if poses.ndim != 2 or poses.shape[1] != 7:
         raise ValueError(f"Expected poses [T, 7], got {poses.shape}")
     if gripper.shape != (poses.shape[0],):
         raise ValueError(f"Expected gripper [T], got {gripper.shape}")
     if cam_from_ee.shape != (4, 4):
         raise ValueError(f"cam_from_ee must be 4x4, got {cam_from_ee.shape}")
+    if ee_from_action.shape != (4, 4):
+        raise ValueError(f"ee_from_action_frame must be 4x4, got {ee_from_action.shape}")
     if wrist_look_distance <= 0:
         raise ValueError(f"wrist_look_distance must be positive, got {wrist_look_distance}")
 
-    ee_from_cam = np.linalg.inv(cam_from_ee)
-    camera_center_ee = ee_from_cam[:3, 3]
-    baseline = np.linalg.norm(camera_center_ee)
-    if baseline < 1e-6:
-        raise ValueError("Degenerate cam←ee transform (zero baseline).")
-    virtual_center = camera_center_ee / baseline * wrist_look_distance
-    world_to_virtual = _look_at_world_to_camera(virtual_center)
+    virtual_cam_from_ee = cam_from_ee.copy()
+    virtual_cam_from_ee[:3, 3] = np.array(
+        [0.0, 0.0, wrist_look_distance], dtype=np.float64
+    )
     axis = min(float(axis_length), 0.35 * float(wrist_look_distance))
 
     ee0 = pose7_to_matrix(poses[0])
     ee0_inv = np.linalg.inv(ee0)
     position = np.empty((len(poses), 3), dtype=np.float64)
-    forward = np.empty_like(position)
+    normal = np.empty_like(position)
     up = np.empty_like(position)
     for index, pose in enumerate(poses):
-        # Relative EE motion, then place through the mount matrix conceptually:
-        # T_cam_ee_t = cam_from_ee @ inv(ee0) @ ee_t  (used via EE0-frame points).
-        relative = ee0_inv @ pose7_to_matrix(pose)
-        origin = relative[:3, 3]
-        rotation = relative[:3, :3]
+        # Map canonical action points into the current embodiment EE frame,
+        # then express them in the window-start EE frame.
+        relative_action = ee0_inv @ pose7_to_matrix(pose) @ ee_from_action
+        origin = relative_action[:3, 3]
+        rotation = relative_action[:3, :3]
         position[index] = origin
-        forward[index] = origin + rotation[:, 0] * axis
+        normal[index] = origin + rotation[:, 0] * axis
         up[index] = origin - rotation[:, 2] * axis
 
-    rotation_w2c = world_to_virtual[:3, :3]
-    translation = world_to_virtual[:3, 3]
-    position_cam = (rotation_w2c @ position.T).T + translation
-    forward_cam = (rotation_w2c @ forward.T).T + translation
-    up_cam = (rotation_w2c @ up.T).T + translation
+    rotation_ee_to_cam = virtual_cam_from_ee[:3, :3]
+    translation_ee_to_cam = virtual_cam_from_ee[:3, 3]
+    position_cam = (rotation_ee_to_cam @ position.T).T + translation_ee_to_cam
+    normal_cam = (rotation_ee_to_cam @ normal.T).T + translation_ee_to_cam
+    up_cam = (rotation_ee_to_cam @ up.T).T + translation_ee_to_cam
     intrinsics = widen_intrinsics(intrinsics_cv, fov_scale, height, width)
     return _render_from_camera_points(
         position_cam.astype(np.float32),
-        forward_cam.astype(np.float32),
+        normal_cam.astype(np.float32),
         up_cam.astype(np.float32),
         gripper,
         intrinsics,
@@ -286,6 +276,8 @@ def render_bimanual_action_images(
     intrinsics_cv: np.ndarray,
     height: int,
     width: int,
+    *,
+    ee_from_action_frame: dict[str, np.ndarray],
     **render_kwargs,
 ) -> np.ndarray:
     """Render both arms with true world projection (head path)."""
@@ -302,6 +294,7 @@ def render_bimanual_action_images(
         intrinsics_cv,
         height,
         width,
+        ee_from_action_frame=ee_from_action_frame["left"],
         **render_kwargs,
     )
     right = render_arm_action_images(
@@ -311,6 +304,7 @@ def render_bimanual_action_images(
         intrinsics_cv,
         height,
         width,
+        ee_from_action_frame=ee_from_action_frame["right"],
         **render_kwargs,
     )
     return np.clip(left + right, 0, 1)
@@ -325,12 +319,17 @@ def render_action_images_for_camera(
     width: int,
     *,
     wrist_cam_from_ee: dict[str, np.ndarray] | None = None,
+    ee_from_action_frame: dict[str, np.ndarray] | None = None,
     **render_kwargs,
 ) -> np.ndarray:
     """Dispatch head (true projection) vs wrist (calibrated ``T_cam←ee``)."""
     action = np.asarray(action_16d, dtype=np.float32)
     if action.ndim != 2 or action.shape[1] != 16:
         raise ValueError(f"Expected bimanual action [T, 16], got {action.shape}")
+    if ee_from_action_frame is None:
+        raise ValueError(
+            "ee_from_action_frame={left,right} is required for action-image rendering."
+        )
 
     if camera_name == "head_camera":
         return render_bimanual_action_images(
@@ -339,6 +338,7 @@ def render_action_images_for_camera(
             intrinsics_cv,
             height,
             width,
+            ee_from_action_frame=ee_from_action_frame,
             **render_kwargs,
         )
     if camera_name in {"left_camera", "right_camera"}:
@@ -353,6 +353,7 @@ def render_action_images_for_camera(
             pose_slice,
             grip_slice,
             wrist_cam_from_ee[side],
+            ee_from_action_frame[side],
             intrinsics_cv,
             height,
             width,

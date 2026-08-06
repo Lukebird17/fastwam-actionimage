@@ -100,7 +100,7 @@ class FastWAMJoint(FastWAM):
         prompt: Optional[str],
         input_image: torch.Tensor,
         action_horizon: int,
-        num_video_frames: int,
+        num_video_frames: Optional[int] = None,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
@@ -120,6 +120,8 @@ class FastWAMJoint(FastWAM):
         tokens.
         """
         self.eval()
+        if num_video_frames is None:
+            raise ValueError("FastWAMJoint.infer_action requires num_video_frames.")
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)

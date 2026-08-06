@@ -4,7 +4,7 @@ RobotWin single-task evaluation entrypoint (Hydra).
 Features:
 - Read `configs/sim_robotwin.yaml`.
 - Check or create the symlink:
-  `RoboTwin/policy/fastwam -> experiments/robotwin/fastwam`.
+  `RoboTwin/policy/fastwam_policy -> experiments/robotwin/fastwam_policy`.
 - Forward config overrides to the official RoboTwin entrypoint
   `script/eval_policy.py` and save logs.
 
@@ -226,8 +226,6 @@ def main(cfg: DictConfig):
     _append_override(overrides, "replan_steps", cfg.EVALUATION.replan_steps)
     _append_override(overrides, "num_inference_steps", cfg.EVALUATION.num_inference_steps)
     _append_override(overrides, "sigma_shift", cfg.EVALUATION.sigma_shift)
-    _append_override(overrides, "text_cfg_scale", cfg.EVALUATION.text_cfg_scale)
-    _append_override(overrides, "negative_prompt", cfg.EVALUATION.negative_prompt)
     _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)

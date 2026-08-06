@@ -1070,6 +1070,7 @@ class FastWAM(torch.nn.Module):
         prompt: Optional[str],
         input_image: torch.Tensor,
         action_horizon: int,
+        num_video_frames: Optional[int] = None,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
@@ -1082,6 +1083,11 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
     ) -> dict[str, Any]:
+        """Infer an action chunk from the segment conditioning frames.
+
+        ``num_video_frames`` is accepted for API parity with ``FastWAMJoint``;
+        the cache-based base model only consumes the conditioning frames.
+        """
         self.eval()
         mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
         if mode not in {"first_frame_causal", "segment_first_frame_causal"}:

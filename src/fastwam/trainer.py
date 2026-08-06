@@ -420,32 +420,37 @@ class Wan22Trainer:
         input_action_image = video0[:, segment_frames].unsqueeze(0) if is_dual_segment else None
 
         # 2. inference and video saving
-        infer_kwargs = {
+        conditioning_kwargs = {
             "input_image": input_image,
-            "num_frames": num_frames,
-            "action": action,
             "action_horizon": sample['action_horizon'],
             "proprio": proprio,
             "input_action_image": input_action_image,
             "text_cfg_scale": 1.0,
-            "action_cfg_scale": 1.0,
             "num_inference_steps": self.eval_num_inference_steps,
             "seed": 42,
             "tiled": False,
         }
         if sample["context"] is not None:
-            infer_kwargs["prompt"] = None
-            infer_kwargs["context"] = sample["context"][0]
-            infer_kwargs["context_mask"] = sample["context_mask"][0]
+            conditioning_kwargs["prompt"] = None
+            conditioning_kwargs["context"] = sample["context"][0]
+            conditioning_kwargs["context_mask"] = sample["context_mask"][0]
         else:
-            infer_kwargs["prompt"] = prompt
+            conditioning_kwargs["prompt"] = prompt
 
-        pred = model.infer(
-            **infer_kwargs,
+        # Action metrics must use the same action-only API as closed-loop deploy.
+        pred_action = model.infer_action(
+            **conditioning_kwargs,
+            num_video_frames=num_frames,
+        )["action"]
+        # Joint denoising is retained only for video rollout metrics.
+        pred = model.infer_joint(
+            **conditioning_kwargs,
+            num_video_frames=num_frames,
+            action=action,
+            test_action_with_infer_action=False,
         )
         
         pred_video = pred["video"]
-        pred_action = pred.get("action", None)
 
         # 3. inference metrics against GT video
         pred_video_tensor = pil_frames_to_video_tensor(pred_video)
@@ -470,6 +475,8 @@ class Wan22Trainer:
                 and isinstance(action_std, torch.Tensor)
             )
             if use_zscore_stats:
+                from fastwam.datasets.robotwin.conditioning import denormalize_action_16d
+
                 for action_name, raw_action in (("pred", pred_action), ("gt", action)):
                     if not isinstance(raw_action, torch.Tensor):
                         raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
@@ -481,8 +488,9 @@ class Wan22Trainer:
                         raise ValueError(
                             f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
                         )
-                    action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
-                    denorm_actions[action_name] = action_btd * action_std + action_mean
+                    denorm_actions[action_name] = denormalize_action_16d(
+                        action_btd, action_mean, action_std
+                    )
             else:
                 if sample["proprio"] is None:
                     raise ValueError("Eval sample must contain `proprio` for action denormalization.")

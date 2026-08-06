@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import bisect
 import hashlib
-import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,16 +12,28 @@ from typing import Sequence
 import h5py
 import numpy as np
 import torch
-import torchvision.transforms.functional as transforms_f
-from PIL import Image
 
 from .action_image import render_action_images_for_camera
-from .wrist_mounts import resolve_wrist_cam_from_ee
+from .conditioning import (
+    DEFAULT_PROMPT,
+    format_robotwin_prompt,
+    load_action_stats,
+    load_text_embedding,
+    normalize_action_16d,
+)
+from .obs_utils import (
+    CAMERA_NAMES,
+    ActionImageRenderConfig,
+    compose_robotwin_views,
+    decode_jpeg,
+    load_action_16d_from_hdf5,
+)
+from .wrist_mounts import resolve_action_image_geometry
 
 
-CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
 ALOHA_EMBODIMENTS = ("aloha-agilex_clean_50", "aloha-agilex_randomized_500")
-DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
+# Re-export for older imports; preferred public location is ``obs_utils.CAMERA_NAMES``.
+__all__ = ["RoboTwinActionImageDataset", "CAMERA_NAMES", "DEFAULT_PROMPT", "ALOHA_EMBODIMENTS"]
 
 
 @dataclass(frozen=True)
@@ -35,19 +46,8 @@ class Episode:
     num_windows: int
 
 
-def _decode_jpeg(value: np.bytes_) -> np.ndarray:
-    with Image.open(io.BytesIO(bytes(value))) as image:
-        return np.asarray(image.convert("RGB"))
-
-
-def _compose_robotwin_views(views: torch.Tensor) -> torch.Tensor:
-    """Compose ``[3, T, C, H, W]`` as head over two wrist views."""
-    if views.ndim != 5 or views.shape[0] != 3:
-        raise ValueError(f"Expected three camera videos [3, T, C, H, W], got {tuple(views.shape)}")
-    head = transforms_f.resize(views[0], [256, 320], antialias=True)
-    left = transforms_f.resize(views[1], [128, 160], antialias=True)
-    right = transforms_f.resize(views[2], [128, 160], antialias=True)
-    return torch.cat((head, torch.cat((left, right), dim=-1)), dim=-2)
+# Backward-compatible alias.
+_decode_jpeg = decode_jpeg
 
 
 class RoboTwinActionImageDataset(torch.utils.data.Dataset):
@@ -82,7 +82,9 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
         action_axis_length: float = 0.1,
         action_sigma: float = 0.05,
         wrist_look_distance: float = 0.25,
+        geometry_embodiment: str | None = None,
         wrist_cam_from_ee: dict | None = None,
+        ee_from_action_frame: dict | None = None,
         include_action_video: bool = True,
         return_video_components: bool = False,
         normalization_stats: str | Path | None = None,
@@ -103,22 +105,18 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
         self.instruction_set = instruction_set
         self.instruction_index = instruction_index
         self.override_instruction = override_instruction
-        self.action_fov_scale = action_fov_scale
-        self.action_axis_length = action_axis_length
-        self.action_sigma = action_sigma
-        self.wrist_look_distance = wrist_look_distance
-        # Prefer explicit config matrices; else resolve from the first embodiment
-        # name (Aloha left/right mounts). Multi-embodiment mixes that share one
-        # mount family (aloha-agilex_*) are fine; mixed families must pass
-        # wrist_cam_from_ee explicitly.
-        embodiment_hint = None
-        if embodiments:
-            embodiment_hint = next(iter(embodiments))
-        elif wrist_cam_from_ee is None:
-            embodiment_hint = "aloha-agilex"
-        self.wrist_cam_from_ee = resolve_wrist_cam_from_ee(
-            wrist_cam_from_ee, embodiment=embodiment_hint
+        self.render_cfg = ActionImageRenderConfig(
+            fov_scale=action_fov_scale,
+            axis_length=action_axis_length,
+            sigma=action_sigma,
+            wrist_look_distance=wrist_look_distance,
         )
+        # Resolve per episode in __getitem__. This is essential for datasets that
+        # mix embodiments; an explicit geometry_embodiment intentionally pins all
+        # episodes to one calibration family.
+        self.geometry_embodiment = geometry_embodiment
+        self.wrist_cam_from_ee_override = wrist_cam_from_ee
+        self.ee_from_action_frame_override = ee_from_action_frame
         # `include_action_video=False` yields the observation video alone, so a pure
         # FastWAM ablation shares this dataset -- same episodes, same window
         # indexing, same 16D action space, same normalization stats, same text
@@ -135,12 +133,7 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
         self.action_std = None
         stats_path = normalization_stats or pretrained_norm_stats
         if stats_path is not None:
-            with Path(stats_path).expanduser().open() as file:
-                stats = json.load(file)
-            self.action_mean = torch.tensor(stats["mean"], dtype=torch.float32)
-            self.action_std = torch.tensor(stats["std"], dtype=torch.float32).clamp_min(1e-6)
-            if self.action_mean.shape != (16,) or self.action_std.shape != (16,):
-                raise ValueError("RoboTwin action normalization stats must contain 16D mean/std.")
+            self.action_mean, self.action_std = load_action_stats(stats_path)
 
         if split not in {"all", "train", "val"}:
             raise ValueError(f"split must be one of all/train/val, got {split}")
@@ -222,37 +215,16 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
                 instructions = json.load(file)
             choices = instructions[self.instruction_set]
             task = choices[self.instruction_index % len(choices)]
-        return DEFAULT_PROMPT.format(task=task)
+        return format_robotwin_prompt(task)
 
     def _text_context(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
         if self.text_embedding_cache_dir is None:
             raise ValueError("text_embedding_cache_dir is not configured.")
-        hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        path = self.text_embedding_cache_dir / f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt"
-        if not path.exists():
-            raise FileNotFoundError(f"Missing text embedding cache {path}; run precompute_text_embeds.py.")
-        payload = torch.load(path, map_location="cpu")
-        context = payload["context"].clone()
-        mask = payload["mask"].bool()
-        if context.ndim != 2 or context.shape[0] != self.context_len:
-            raise ValueError(f"Invalid cached context shape {tuple(context.shape)} in {path}")
-        if mask.shape != (self.context_len,):
-            raise ValueError(f"Invalid cached context mask shape {tuple(mask.shape)} in {path}")
-        context[~mask] = 0
-        return context, torch.ones_like(mask)
-
-    @staticmethod
-    def _load_action_16d(episode_file: h5py.File, indices: np.ndarray) -> np.ndarray:
-        endpose = episode_file["endpose"]
-        return np.concatenate(
-            (
-                endpose["left_endpose"][:][indices],
-                endpose["left_gripper"][:][indices, None],
-                endpose["right_endpose"][:][indices],
-                endpose["right_gripper"][:][indices, None],
-            ),
-            axis=-1,
-        ).astype(np.float32)
+        return load_text_embedding(
+            prompt,
+            self.text_embedding_cache_dir,
+            context_len=self.context_len,
+        )
 
     def __getitem__(self, index: int) -> dict[str, object]:
         episode, start = self._locate(index)
@@ -263,13 +235,19 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
 
         scene_views = []
         action_views = []
+        geometry_embodiment = self.geometry_embodiment or episode.embodiment
+        geometry = resolve_action_image_geometry(
+            geometry_embodiment,
+            wrist_cam_from_ee=self.wrist_cam_from_ee_override,
+            ee_from_action_frame=self.ee_from_action_frame_override,
+        )
         with h5py.File(episode.path, "r") as episode_file:
-            all_actions = self._load_action_16d(episode_file, indices)
+            all_actions = load_action_16d_from_hdf5(episode_file, indices)
             rendered_actions = all_actions[self.video_sample_indices]
             observations = episode_file["observation"]
             for camera_name in CAMERA_NAMES:
                 camera = observations[camera_name]
-                rgb = np.stack([_decode_jpeg(camera["rgb"][frame]) for frame in video_indices])
+                rgb = np.stack([decode_jpeg(camera["rgb"][frame]) for frame in video_indices])
                 height, width = rgb.shape[1:3]
                 scene_views.append(torch.from_numpy(rgb).permute(0, 3, 1, 2))
                 if not self.include_action_video:
@@ -281,19 +259,20 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
                     camera["intrinsic_cv"][indices[0]],
                     height,
                     width,
-                    fov_scale=self.action_fov_scale,
-                    axis_length=self.action_axis_length,
-                    sigma=self.action_sigma,
-                    wrist_look_distance=self.wrist_look_distance,
-                    wrist_cam_from_ee=self.wrist_cam_from_ee,
+                    fov_scale=self.render_cfg.fov_scale,
+                    axis_length=self.render_cfg.axis_length,
+                    sigma=self.render_cfg.sigma,
+                    wrist_look_distance=self.render_cfg.wrist_look_distance,
+                    wrist_cam_from_ee=geometry.wrist_cam_from_ee,
+                    ee_from_action_frame=geometry.ee_from_action_frame,
                 )
                 action_views.append(torch.from_numpy(action_rgb).permute(0, 3, 1, 2))
 
-        scene_video = _compose_robotwin_views(torch.stack(scene_views)).float() / 255
+        scene_video = compose_robotwin_views(torch.stack(scene_views)).float() / 255
         scene_video = scene_video.mul(2).sub(1).permute(1, 0, 2, 3)
         action_video = None
         if self.include_action_video:
-            action_video = _compose_robotwin_views(torch.stack(action_views)).float()
+            action_video = compose_robotwin_views(torch.stack(action_views)).float()
             action_video = action_video.mul(2).sub(1).permute(1, 0, 2, 3)
             video = torch.cat((scene_video, action_video), dim=1)
         else:
@@ -304,7 +283,7 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
         prompt = self._instruction(episode)
         actions = torch.from_numpy(all_actions)
         if self.action_mean is not None and self.action_std is not None:
-            actions = (actions - self.action_mean) / self.action_std
+            actions = normalize_action_16d(actions, self.action_mean, self.action_std)
         sample = {
             "video": video,
             "action": actions[1:],

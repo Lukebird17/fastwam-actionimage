@@ -9,7 +9,8 @@ ckpt: null
 gpu_id: 0
 
 model:
-  load_text_encoder: true
+  # Match training: consume precomputed text embeddings from data config.
+  load_text_encoder: false
   skip_dit_load_from_pretrain: true
   action_dit_pretrained_path: null
 
@@ -24,15 +25,14 @@ EVALUATION:
 
   # Action inference (16D ee + action-image conditioning)
   action_horizon: null
-  replan_steps: 24
+  # null executes the full supervised horizon before replanning.
+  replan_steps: null
   num_inference_steps: ${eval_num_inference_steps}
   sigma_shift: null
-  text_cfg_scale: 1.0
-  negative_prompt: ""
   rand_device: cpu
   tiled: false
   timing_enabled: false
-  skip_get_obs_within_replan: false
+  skip_get_obs_within_replan: true
 
   # Runtime inputs
   dataset_stats_path: ./data/RoboTwin2.0/aloha_action_16d_stats.json

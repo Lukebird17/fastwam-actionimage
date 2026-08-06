@@ -25,13 +25,20 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from fastwam.datasets.robotwin.obs_utils import (
-    compose_robotwin_rgb_tensor,
-    endpose_dict_to_action_16d,
-    render_action_image_tensor,
+from fastwam.datasets.robotwin.conditioning import (
+    denormalize_action_16d,
+    format_robotwin_prompt,
+    load_action_stats,
+    load_text_embedding,
+    normalize_action_16d,
 )
-from fastwam.datasets.robotwin.raw_dataset import DEFAULT_PROMPT
-from fastwam.datasets.robotwin.wrist_mounts import resolve_wrist_cam_from_ee
+from fastwam.datasets.robotwin.obs_utils import (
+    ActionImageRenderConfig,
+    build_closed_loop_visuals,
+    dual_segment_video_frames,
+    resolve_geometry_from_data_cfg,
+)
+from fastwam.utils.precision import mixed_precision_to_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -66,25 +73,6 @@ def _parse_optional_float(value: Any) -> Optional[float]:
     if _is_none_like(value):
         return None
     return float(value)
-
-
-def _normalize_mixed_precision(mixed_precision: str) -> str:
-    key = str(mixed_precision).strip().lower()
-    if key not in {"no", "fp16", "bf16"}:
-        raise ValueError(
-            f"Unsupported mixed_precision: {mixed_precision}. "
-            "Expected one of: ['no', 'fp16', 'bf16']."
-        )
-    return key
-
-
-def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
-    precision = _normalize_mixed_precision(mixed_precision)
-    if precision == "no":
-        return torch.float32
-    if precision == "fp16":
-        return torch.float16
-    return torch.bfloat16
 
 
 def _resolve_sim_cfg_name(sim_cfg_path: Optional[str], sim_cfg_name: Optional[str]) -> str:
@@ -140,20 +128,13 @@ def _resolve_dataset_stats_path(dataset_stats_path: Optional[str], cfg: DictConf
     )
 
 
-def _load_action_stats(path: Path) -> tuple[torch.Tensor, torch.Tensor]:
-    import json
-
-    with path.open() as file:
-        payload = json.load(file)
-    mean = torch.tensor(payload["mean"], dtype=torch.float32)
-    std = torch.tensor(payload["std"], dtype=torch.float32).clamp_min(1e-6)
-    if mean.shape != (16,) or std.shape != (16,):
-        raise ValueError(f"Expected 16D mean/std in {path}, got {tuple(mean.shape)}/{tuple(std.shape)}")
-    return mean, std
-
-
 class WorldActionRobotWinPolicy:
-    """Closed-loop policy for action-image FastWAM checkpoints (16D ee)."""
+    """Closed-loop policy for FastWAM RoboTwin checkpoints (16D ee).
+
+    Supports both:
+    - action-image models (``segment_first_frame_causal``): RGB + action-image
+    - scene-only models (``first_frame_causal``): RGB only
+    """
 
     def __init__(
         self,
@@ -168,36 +149,44 @@ class WorldActionRobotWinPolicy:
         num_inference_steps: int,
         sigma_shift: Optional[float],
         seed: Optional[int],
-        text_cfg_scale: float,
-        negative_prompt: str,
         rand_device: str,
         tiled: bool,
         timing_enabled: bool,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
-        model_cfg_copy.load_text_encoder = True
+        # Training uses precomputed T5 contexts; evaluation must use the same
+        # tensors rather than a separate online text-encoder path.
+        model_cfg_copy.load_text_encoder = False
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
 
-        self.action_mean, self.action_std = _load_action_stats(dataset_stats_path)
-        self.action_fov_scale = float(data_cfg.train.get("action_fov_scale", 1.0))
-        self.action_axis_length = float(data_cfg.train.get("action_axis_length", 0.1))
-        self.action_sigma = float(data_cfg.train.get("action_sigma", 0.05))
-        self.wrist_look_distance = float(data_cfg.train.get("wrist_look_distance", 0.25))
-        self.wrist_cam_from_ee = resolve_wrist_cam_from_ee(
-            data_cfg.train.get("wrist_cam_from_ee"),
-            embodiment="aloha-agilex",
+        self.action_mean, self.action_std = load_action_stats(dataset_stats_path)
+        self.render_cfg = ActionImageRenderConfig.from_data_cfg(data_cfg.train)
+        self.geometry = resolve_geometry_from_data_cfg(data_cfg.train)
+
+        cache_dir = Path(str(data_cfg.train.text_embedding_cache_dir)).expanduser()
+        self.text_embedding_cache_dir = (
+            cache_dir if cache_dir.is_absolute() else (PROJECT_ROOT / cache_dir).resolve()
         )
+        self.context_len = int(data_cfg.train.get("context_len", 128))
+        self._text_context_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        mask_mode = str(
+            getattr(self.model.video_expert, "video_attention_mask_mode", "first_frame_causal")
+        )
+        self.include_action_image = mask_mode == "segment_first_frame_causal"
+        raw_num_frames = int(data_cfg.train.get("num_frames", 33))
+        video_stride = int(data_cfg.train.get("action_video_freq_ratio", 4))
+        segment_frames, dual_frames = dual_segment_video_frames(raw_num_frames, video_stride)
+        self.num_video_frames = dual_frames if self.include_action_image else segment_frames
 
         self.action_horizon = int(action_horizon)
         self.replan_steps = int(max(1, min(replan_steps, action_horizon)))
         self.num_inference_steps = int(num_inference_steps)
         self.sigma_shift = sigma_shift
         self.seed = seed
-        self.text_cfg_scale = float(text_cfg_scale)
-        self.negative_prompt = str(negative_prompt)
         self.rand_device = str(rand_device)
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
@@ -208,67 +197,68 @@ class WorldActionRobotWinPolicy:
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
-            "Initialized action-image RoboTwin policy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized RoboTwin policy | ckpt=%s | stats=%s | mask=%s | "
+            "action_image=%s | horizon=%d | replan=%d | video_frames=%d",
             checkpoint_path,
             dataset_stats_path,
+            mask_mode,
+            self.include_action_image,
             self.action_horizon,
             self.replan_steps,
+            self.num_video_frames,
         )
 
-    def _normalize_action(self, action: np.ndarray) -> torch.Tensor:
-        action_t = torch.as_tensor(action, dtype=torch.float32)
-        return (action_t - self.action_mean) / self.action_std
-
-    def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
-        action = action.detach().to(dtype=torch.float32, device="cpu")
-        if action.ndim == 2:
-            action = action.unsqueeze(0)
-        denorm = action * self.action_std + self.action_mean
-        return denorm.numpy()
+    def _text_context(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if prompt not in self._text_context_cache:
+            self._text_context_cache[prompt] = load_text_embedding(
+                prompt,
+                self.text_embedding_cache_dir,
+                context_len=self.context_len,
+            )
+        return self._text_context_cache[prompt]
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
-        if "endpose" not in observation:
-            raise KeyError(
-                "Observation is missing `endpose`. Enable data_type.endpose in the RoboTwin task config."
-            )
-        action_16d = endpose_dict_to_action_16d(observation["endpose"])
-        proprio = self._normalize_action(action_16d)
-
-        image_tensor = compose_robotwin_rgb_tensor(observation).to(
-            device=self.model.device, dtype=self.model.torch_dtype
-        )
-        action_image = render_action_image_tensor(
+        action_16d, input_image, input_action_image = build_closed_loop_visuals(
             observation,
-            action_16d,
-            action_fov_scale=self.action_fov_scale,
-            action_axis_length=self.action_axis_length,
-            action_sigma=self.action_sigma,
-            wrist_look_distance=self.wrist_look_distance,
-            wrist_cam_from_ee=self.wrist_cam_from_ee,
-        ).to(device=self.model.device, dtype=self.model.torch_dtype)
+            geometry=self.geometry,
+            render_cfg=self.render_cfg,
+            include_action_image=self.include_action_image,
+        )
+        proprio = normalize_action_16d(action_16d, self.action_mean, self.action_std)
+        prompt = format_robotwin_prompt(instruction)
+        context, context_mask = self._text_context(prompt)
 
-        prompt = DEFAULT_PROMPT.format(task=instruction)
         infer_kwargs = {
-            "prompt": prompt,
-            "input_image": image_tensor,
-            "input_action_image": action_image,
+            "prompt": None,
+            "context": context,
+            "context_mask": context_mask,
+            "input_image": input_image.to(
+                device=self.model.device, dtype=self.model.torch_dtype
+            ),
             "action_horizon": self.action_horizon,
+            "num_video_frames": self.num_video_frames,
             "proprio": proprio,
-            "negative_prompt": self.negative_prompt,
-            "text_cfg_scale": self.text_cfg_scale,
             "num_inference_steps": self.num_inference_steps,
             "sigma_shift": self.sigma_shift,
             "seed": self.seed,
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
+        if input_action_image is not None:
+            infer_kwargs["input_action_image"] = input_action_image.to(
+                device=self.model.device, dtype=self.model.torch_dtype
+            )
+
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
-        return self._denormalize_action(pred["action"])[0]
+        action = pred["action"]
+        if action.ndim == 2:
+            action = action.unsqueeze(0)
+        return denormalize_action_16d(action, self.action_mean, self.action_std).numpy()[0]
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
@@ -338,7 +328,7 @@ def get_model(usr_args: Dict[str, Any]):
         device = "cpu"
 
     mixed_precision = str(usr_args.get("mixed_precision") or cfg.get("mixed_precision", "bf16"))
-    model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
+    model_dtype = mixed_precision_to_dtype(mixed_precision)
     dataset_stats_path = _resolve_dataset_stats_path(
         dataset_stats_path=usr_args.get("dataset_stats_path") or cfg.EVALUATION.get("dataset_stats_path"),
         cfg=cfg,
@@ -353,7 +343,9 @@ def get_model(usr_args: Dict[str, Any]):
 
     replan_steps = _parse_optional_int(usr_args.get("replan_steps"))
     if replan_steps is None:
-        replan_steps = int(cfg.EVALUATION.get("replan_steps", 8))
+        replan_steps = _parse_optional_int(cfg.EVALUATION.get("replan_steps"))
+    if replan_steps is None:
+        replan_steps = action_horizon
 
     num_inference_steps = _parse_optional_int(usr_args.get("num_inference_steps"))
     if num_inference_steps is None:
@@ -375,8 +367,6 @@ def get_model(usr_args: Dict[str, Any]):
         num_inference_steps=num_inference_steps,
         sigma_shift=sigma_shift,
         seed=_parse_optional_int(usr_args.get("seed")),
-        text_cfg_scale=float(usr_args.get("text_cfg_scale", cfg.EVALUATION.get("text_cfg_scale", 1.0))),
-        negative_prompt=str(usr_args.get("negative_prompt", cfg.EVALUATION.get("negative_prompt", ""))),
         rand_device=str(usr_args.get("rand_device", cfg.EVALUATION.get("rand_device", "cpu"))),
         tiled=_parse_bool(usr_args.get("tiled", cfg.EVALUATION.get("tiled", False))),
         timing_enabled=_parse_bool(

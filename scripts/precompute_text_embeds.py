@@ -13,7 +13,8 @@ import torch.distributed as dist
 from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
-from fastwam.datasets.robotwin.raw_dataset import ALOHA_EMBODIMENTS, DEFAULT_PROMPT
+from fastwam.datasets.robotwin.conditioning import format_robotwin_prompt
+from fastwam.datasets.robotwin.raw_dataset import ALOHA_EMBODIMENTS
 from fastwam.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
 from fastwam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 from fastwam.utils.config_resolvers import register_default_resolvers
@@ -136,7 +137,7 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
                 if "task" not in record:
                     raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
                 task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
+                prompt = format_robotwin_prompt(task)
                 total_task_rows += 1
                 if prompt not in seen:
                     seen.add(prompt)
@@ -160,7 +161,6 @@ def _read_unique_raw_robotwin_prompts(nodes: list[DictConfig]) -> list[str]:
         tasks = set(str(task) for task in node.get("tasks", []) or [])
         embodiments = set(str(name) for name in node.get("embodiments", []) or ALOHA_EMBODIMENTS)
         instruction_set = str(node.get("instruction_set", "seen"))
-        instruction_index = int(node.get("instruction_index", 0))
         for path in sorted(root.glob("*/*/instructions/episode*.json")):
             if path in visited_files:
                 continue
@@ -170,10 +170,13 @@ def _read_unique_raw_robotwin_prompts(nodes: list[DictConfig]) -> list[str]:
             visited_files.add(path)
             with path.open() as file:
                 choices = json.load(file)[instruction_set]
-            prompt = DEFAULT_PROMPT.format(task=choices[instruction_index % len(choices)])
-            if prompt not in seen:
-                seen.add(prompt)
-                prompts.append(prompt)
+            # Cache every instruction that eval may sample, not only the fixed
+            # training instruction_index.
+            for instruction in choices:
+                prompt = format_robotwin_prompt(instruction)
+                if prompt not in seen:
+                    seen.add(prompt)
+                    prompts.append(prompt)
     logger.info("Loaded %d unique prompts from %d raw RoboTwin instruction files.", len(prompts), len(visited_files))
     return prompts
 
@@ -184,7 +187,7 @@ def _get_override_prompt(override_instruction: Any) -> str | None:
     task = str(override_instruction).strip()
     if task == "":
         return None
-    return DEFAULT_PROMPT.format(task=task)
+    return format_robotwin_prompt(task)
 
 
 def _model_id_to_enc_id(model_id: str) -> str:

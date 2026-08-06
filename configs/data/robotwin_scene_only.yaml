@@ -1,3 +1,14 @@
+# Pure-FastWAM control: the SAME dataset as `robotwin_action_image.yaml` with the
+# action-image half switched off.
+#
+# Keep this file a line-for-line copy of `robotwin_action_image.yaml` plus
+# `include_action_video: false`. Sharing the dataset class is what makes the
+# comparison interpretable -- identical episodes, window indexing, 16D action
+# space, normalization stats and text cache -- so the action image is the only
+# variable. The render knobs below are inert when the action half is off; they
+# are kept so a diff against the treatment config stays a one-line diff, which is
+# how the two arms are checked for drift after
+# scripts/sync_from_upstream_worktree.sh.
 train:
   _target_: fastwam.datasets.robotwin.RoboTwinActionImageDataset
   dataset_root: ./data/RoboTwin2.0/dataset
@@ -18,6 +29,10 @@ train:
   action_fov_scale: 1.0
   action_axis_length: 0.1
   action_sigma: 0.05
+  wrist_look_distance: 0.25
+  # Single source of truth: per-side wrist/action transforms live in
+  # fastwam.datasets.robotwin.wrist_mounts.
+  geometry_embodiment: aloha-agilex
   include_action_video: false
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
@@ -45,6 +60,8 @@ val:
   action_fov_scale: 1.0
   action_axis_length: 0.1
   action_sigma: 0.05
+  wrist_look_distance: 0.25
+  geometry_embodiment: aloha-agilex
   include_action_video: false
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image

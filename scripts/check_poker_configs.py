@@ -1,10 +1,13 @@
 """Validate the two poker-experiment configs without touching a GPU.
 
 Checks that (a) hydra composes both task configs, (b) the shared dataset yields
-the shapes each arm's model expects, and (c) the two arms differ ONLY in the
-action-image half -- same episodes, same window count, same 16D action space.
+the shapes each arm's model expects, (c) the two arms differ ONLY in the
+action-image half -- same episodes, same window count, same 16D action space --
+and (d) the two data configs are still a one-line diff, which is what catches
+the arms silently drifting apart when the shared tree is re-synced.
 
-Run after any change to the RoboTwin dataset or to either arm's config:
+Run after any change to the RoboTwin dataset or to either arm's config, and
+always after scripts/sync_from_upstream_worktree.sh:
     python scripts/check_poker_configs.py
 """
 import os
@@ -22,6 +25,32 @@ from omegaconf import OmegaConf
 CONFIG_DIR = str(Path("configs").resolve())
 VAE_TEMPORAL_FACTOR = 4
 ARMS = ("robotwin_poker_scene_only_1x4", "robotwin_poker_action_image_1x4")
+# The control data config must stay the treatment config plus this one key. A
+# `cp -a` fork goes stale every time the shared tree advances, and a renderer
+# calibration landing on only one side would make the arms incomparable while
+# both configs still look individually valid.
+CONTROL_ONLY_KEYS = {"include_action_video"}
+
+
+def check_data_configs_are_one_line_apart() -> None:
+    treatment = OmegaConf.load("configs/data/robotwin_action_image.yaml")
+    control = OmegaConf.load("configs/data/robotwin_scene_only.yaml")
+    print("\n=== control vs treatment data config ===")
+    for split in ("train", "val"):
+        t = OmegaConf.to_container(treatment[split])
+        c = OmegaConf.to_container(control[split])
+        extra = set(c) - set(t)
+        missing = set(t) - set(c)
+        differing = {k for k in set(t) & set(c) if t[k] != c[k]}
+        print(f"  {split}: control-only={sorted(extra)} missing={sorted(missing)} "
+              f"differing={sorted(differing)}")
+        assert extra == CONTROL_ONLY_KEYS, f"{split}: unexpected control-only keys {sorted(extra)}"
+        assert not missing, f"{split}: control is missing {sorted(missing)} -- arms have drifted"
+        assert not differing, f"{split}: shared keys differ {sorted(differing)} -- arms have drifted"
+    print("  OK: the action-image switch is the only difference")
+
+
+check_data_configs_are_one_line_apart()
 
 
 def load(task: str):

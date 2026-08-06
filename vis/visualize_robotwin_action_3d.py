@@ -18,7 +18,8 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from PIL import Image, ImageDraw
 
 from fastwam.datasets.robotwin.action_image import quaternion_wxyz_to_matrix
-from fastwam.datasets.robotwin.raw_dataset import _decode_jpeg
+from fastwam.datasets.robotwin.obs_utils import decode_jpeg
+from fastwam.datasets.robotwin.wrist_mounts import resolve_action_image_geometry
 
 
 CAMERA_NAMES = ("head_camera", "left_camera", "right_camera")
@@ -71,7 +72,7 @@ def load_window(episode: Path, start: int, num_frames: int, stride: int) -> dict
             cam = file["observation"][name]
             extrinsic0 = np.asarray(cam["extrinsic_cv"][indices[0]], dtype=np.float32)
             intrinsic0 = np.asarray(cam["intrinsic_cv"][indices[0]], dtype=np.float32)
-            rgb0 = _decode_jpeg(cam["rgb"][indices[0]])
+            rgb0 = decode_jpeg(cam["rgb"][indices[0]])
             centers, rotations = [], []
             for frame in indices:
                 center, rotation = camera_from_extrinsic_cv(cam["extrinsic_cv"][frame])
@@ -87,10 +88,12 @@ def load_window(episode: Path, start: int, num_frames: int, stride: int) -> dict
                 "rotation0": rotations[0],
             }
 
+    geometry = resolve_action_image_geometry(episode.parents[1].name)
     return {
         "indices": indices,
         "left_pose": left_pose,
         "right_pose": right_pose,
+        "ee_from_action_frame": geometry.ee_from_action_frame,
         "cameras": cameras,
     }
 
@@ -172,8 +175,16 @@ def draw_small_camera(
         ax.text(center[0], center[1], center[2], f" {name.replace('_camera', '')}", color=color, fontsize=7)
 
 
-def draw_ee_state(ax, poses: np.ndarray, index: int, color: str, axis_length: float, label: str | None):
-    rotation = quaternion_wxyz_to_matrix(poses[:, 3:7])
+def draw_ee_state(
+    ax,
+    poses: np.ndarray,
+    ee_from_action_frame: np.ndarray,
+    index: int,
+    color: str,
+    axis_length: float,
+    label: str | None,
+):
+    rotation = quaternion_wxyz_to_matrix(poses[:, 3:7]) @ ee_from_action_frame[:3, :3]
     position = poses[:, :3]
     trail = position[: index + 1]
     ax.plot(trail[:, 0], trail[:, 1], trail[:, 2], color=color, linewidth=2.0, label=label, alpha=0.95)
@@ -187,10 +198,10 @@ def draw_ee_state(ax, poses: np.ndarray, index: int, color: str, axis_length: fl
             alpha=0.25,
         )
     origin = position[index]
-    forward = origin + rotation[index, :, 0] * axis_length
+    normal = origin + rotation[index, :, 0] * axis_length
     up = origin - rotation[index, :, 2] * axis_length
     ax.scatter(origin[0], origin[1], origin[2], color="#e41a1c", s=22, depthshade=False)
-    ax.plot([origin[0], forward[0]], [origin[1], forward[1]], [origin[2], forward[2]], color="#4daf4a", lw=2.0)
+    ax.plot([origin[0], normal[0]], [origin[1], normal[1]], [origin[2], normal[2]], color="#4daf4a", lw=2.0)
     ax.plot([origin[0], up[0]], [origin[1], up[1]], [origin[2], up[2]], color="#377eb8", lw=2.0)
 
 
@@ -214,8 +225,24 @@ def render_frame(
     fig = plt.figure(figsize=(8.5, 7.0), dpi=120)
     ax = fig.add_subplot(111, projection="3d")
 
-    draw_ee_state(ax, data["left_pose"], index, "#ff7f0e", axis_length, "left_ee" if index == 0 else None)
-    draw_ee_state(ax, data["right_pose"], index, "#9467bd", axis_length, "right_ee" if index == 0 else None)
+    draw_ee_state(
+        ax,
+        data["left_pose"],
+        data["ee_from_action_frame"]["left"],
+        index,
+        "#ff7f0e",
+        axis_length,
+        "left_ee" if index == 0 else None,
+    )
+    draw_ee_state(
+        ax,
+        data["right_pose"],
+        data["ee_from_action_frame"]["right"],
+        index,
+        "#9467bd",
+        axis_length,
+        "right_ee" if index == 0 else None,
+    )
 
     for name, camera in data["cameras"].items():
         # Action-image convention: fixed window-start extrinsics.
@@ -251,7 +278,7 @@ def render_frame(
     frame_id = int(data["indices"][index])
     ax.set_title(
         f"t={index}/{len(data['indices']) - 1}  raw_frame={frame_id}\n"
-        "solid trail=EE so far; green=+X, blue=-Z; cameras@window-start (small)",
+        "solid trail=EE so far; green=normal, blue=up; cameras@window-start (small)",
         fontsize=9,
     )
     if index == 0:
@@ -299,12 +326,12 @@ def write_html(data: dict, output_path: Path, axis_length: float, camera_axis_le
     fig = go.Figure()
     n = len(data["indices"])
 
-    for arm_name, poses, color in (
-        ("left_ee", data["left_pose"], "#ff7f0e"),
-        ("right_ee", data["right_pose"], "#9467bd"),
+    for arm_name, poses, ee_from_action, color in (
+        ("left_ee", data["left_pose"], data["ee_from_action_frame"]["left"], "#ff7f0e"),
+        ("right_ee", data["right_pose"], data["ee_from_action_frame"]["right"], "#9467bd"),
     ):
         position = poses[:, :3]
-        rotation = quaternion_wxyz_to_matrix(poses[:, 3:7])
+        rotation = quaternion_wxyz_to_matrix(poses[:, 3:7]) @ ee_from_action[:3, :3]
         fig.add_trace(
             go.Scatter3d(
                 x=position[:, 0],
@@ -320,9 +347,9 @@ def write_html(data: dict, output_path: Path, axis_length: float, camera_axis_le
         xs, ys, zs = [], [], []
         for index in range(0, n, max(1, n // 10)):
             origin = position[index]
-            forward = origin + rotation[index, :, 0] * axis_length
+            normal = origin + rotation[index, :, 0] * axis_length
             up = origin - rotation[index, :, 2] * axis_length
-            for tip in (forward, up):
+            for tip in (normal, up):
                 xs += [origin[0], tip[0], None]
                 ys += [origin[1], tip[1], None]
                 zs += [origin[2], tip[2], None]

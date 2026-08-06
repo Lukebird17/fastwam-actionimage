@@ -19,18 +19,9 @@ train:
   action_axis_length: 0.1
   action_sigma: 0.05
   wrist_look_distance: 0.25
-  # Per-side rigid T_cam←ee (4x4). Swap these for a new embodiment.
-  wrist_cam_from_ee:
-    left:
-      - [0.0, -1.0, 0.0, 0.032]
-      - [-0.38941823, 0.0, -0.92106107, 0.08712835]
-      - [0.92106108, 0.0, -0.38941822, -0.03916204]
-      - [0.0, 0.0, 0.0, 1.0]
-    right:
-      - [0.0, -1.0, 0.0, 0.032]
-      - [-0.38941837, 0.0, -0.92106097, 0.08712839]
-      - [0.92106118, 0.0, -0.38941837, -0.03916218]
-      - [0.0, 0.0, 0.0, 1.0]
+  # Single source of truth: per-side wrist/action transforms live in
+  # fastwam.datasets.robotwin.wrist_mounts.
+  geometry_embodiment: aloha-agilex
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
   context_len: 128
@@ -58,17 +49,7 @@ val:
   action_axis_length: 0.1
   action_sigma: 0.05
   wrist_look_distance: 0.25
-  wrist_cam_from_ee:
-    left:
-      - [0.0, -1.0, 0.0, 0.032]
-      - [-0.38941823, 0.0, -0.92106107, 0.08712835]
-      - [0.92106108, 0.0, -0.38941822, -0.03916204]
-      - [0.0, 0.0, 0.0, 1.0]
-    right:
-      - [0.0, -1.0, 0.0, 0.032]
-      - [-0.38941837, 0.0, -0.92106097, 0.08712839]
-      - [0.92106118, 0.0, -0.38941837, -0.03916218]
-      - [0.0, 0.0, 0.0, 1.0]
+  geometry_embodiment: aloha-agilex
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
   context_len: 128

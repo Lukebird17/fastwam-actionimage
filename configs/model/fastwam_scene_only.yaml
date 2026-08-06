@@ -1,0 +1,74 @@
+# Pure-FastWAM control for the action-image experiment.
+#
+# Byte-identical to `fastwam_action_image.yaml` except for the two things the
+# action image implies:
+#   * `video_attention_mask_mode`: the video is ONE segment here, so
+#     `segment_first_frame_causal` (which requires two equal latent segments)
+#     falls back to the upstream default `first_frame_causal`.
+#   * `loss.lambda_action_image` is dropped -- there is no second segment to
+#     supervise. `lambda_rgb` / `lambda_action` keep their values so the two runs
+#     weight the shared terms identically.
+# Everything else (backbone, ActionDiT init, schedulers, seperated_timestep,
+# fuse_vae_embedding_in_latents) is held fixed so the action image is the only
+# variable. Reads `data.train.action_dim` rather than
+# `data.train.processor.action_output_dim` because it pairs with
+# `robotwin_scene_only`, i.e. the same raw-HDF5 16D pipeline.
+_target_: fastwam.runtime.create_fastwam
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.proprio_dim}
+redirect_common_files: true
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+skip_dit_load_from_pretrain: false
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: first_frame_causal
+  action_conditioned: false
+  action_dim: ${data.train.action_dim}
+  action_group_causal_mask_mode: group_diagonal
+
+action_dit_config:
+  action_dim: ${data.train.action_dim}
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+loss:
+  lambda_rgb: 1.0
+  lambda_action: 1.0

@@ -315,6 +315,15 @@ class Wan22Trainer:
         num_video_frames = video.shape[2]
         if num_video_frames <= 1:
             raise ValueError(f"`sample['video']` must have at least 2 frames for action evaluation, got {num_video_frames}")
+        temporal_factor = 4
+        if num_video_frames % temporal_factor == 1:
+            segment_frames = num_video_frames
+        elif num_video_frames % 2 == 0 and (num_video_frames // 2) % temporal_factor == 1:
+            segment_frames = num_video_frames // 2
+        else:
+            raise ValueError(
+                f"`sample['video']` must be one valid segment or two equal segments, got T={num_video_frames}"
+            )
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -337,8 +346,11 @@ class Wan22Trainer:
                 action = action.unsqueeze(0)
             if action.ndim != 3:
                 raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
-            if action.shape[1] % (num_video_frames - 1) != 0:
-                raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
+            if action.shape[1] % (segment_frames - 1) != 0:
+                raise ValueError(
+                    "`sample['action']` temporal dimension must be divisible by "
+                    f"per-segment transitions ({segment_frames - 1}), got {action.shape[1]}"
+                )
             action_horizon = int(action.shape[1])
 
         proprio = None
@@ -396,8 +408,16 @@ class Wan22Trainer:
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
         proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
-        input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
+        is_dual_segment = (
+            num_frames % 2 == 0
+            and (num_frames // 2) % 4 == 1
+            and str(getattr(model.video_expert, "video_attention_mask_mode", ""))
+            == "segment_first_frame_causal"
+        )
+        segment_frames = num_frames // 2 if is_dual_segment else num_frames
+        input_image = video0[:, 0].unsqueeze(0)
+        input_action_image = video0[:, segment_frames].unsqueeze(0) if is_dual_segment else None
 
         # 2. inference and video saving
         infer_kwargs = {
@@ -406,6 +426,7 @@ class Wan22Trainer:
             "action": action,
             "action_horizon": sample['action_horizon'],
             "proprio": proprio,
+            "input_action_image": input_action_image,
             "text_cfg_scale": 1.0,
             "action_cfg_scale": 1.0,
             "num_inference_steps": self.eval_num_inference_steps,
@@ -441,45 +462,64 @@ class Wan22Trainer:
         action_l1 = None
         action_l2 = None
         if action is not None and pred_action is not None:
-            if sample["proprio"] is None:
-                raise ValueError("Eval sample must contain `proprio` for action denormalization.")
-            proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
-            
-            processor = self.val_dataset.lerobot_dataset.processor
-
             denorm_actions = {}
-            action_meta = processor.shape_meta["action"]
-            state_meta = processor.shape_meta["state"]
-            for action_name, raw_action in (("pred", pred_action), ("gt", action)):
-                if not isinstance(raw_action, torch.Tensor):
-                    raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
-                if raw_action.ndim == 2:
-                    action_btd = raw_action.unsqueeze(0)
-                elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
-                    action_btd = raw_action
-                else:
-                    raise ValueError(
-                        f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
-                    )
-                action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
+            action_mean = getattr(self.val_dataset, "action_mean", None)
+            action_std = getattr(self.val_dataset, "action_std", None)
+            use_zscore_stats = (
+                isinstance(action_mean, torch.Tensor)
+                and isinstance(action_std, torch.Tensor)
+            )
+            if use_zscore_stats:
+                for action_name, raw_action in (("pred", pred_action), ("gt", action)):
+                    if not isinstance(raw_action, torch.Tensor):
+                        raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
+                    if raw_action.ndim == 2:
+                        action_btd = raw_action.unsqueeze(0)
+                    elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
+                        action_btd = raw_action
+                    else:
+                        raise ValueError(
+                            f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
+                        )
+                    action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
+                    denorm_actions[action_name] = action_btd * action_std + action_mean
+            else:
+                if sample["proprio"] is None:
+                    raise ValueError("Eval sample must contain `proprio` for action denormalization.")
+                proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
+                processor = self.val_dataset.lerobot_dataset.processor
+                action_meta = processor.shape_meta["action"]
+                state_meta = processor.shape_meta["state"]
+                for action_name, raw_action in (("pred", pred_action), ("gt", action)):
+                    if not isinstance(raw_action, torch.Tensor):
+                        raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
+                    if raw_action.ndim == 2:
+                        action_btd = raw_action.unsqueeze(0)
+                    elif raw_action.ndim == 3 and raw_action.shape[0] == 1:
+                        action_btd = raw_action
+                    else:
+                        raise ValueError(
+                            f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
+                        )
+                    action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
 
-                batch = {
-                    "action": action_btd,
-                    "state": proprio,
-                }
-                batch = processor.action_state_merger.backward(batch)
-                batch = processor.normalizer.backward(batch)
-                merged_batch = {
-                    "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
-                    "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
-                }
-                merged_batch = processor.action_state_merger.forward(merged_batch)
-                denorm_action = merged_batch["action"].unsqueeze(0)
-                if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
-                    raise ValueError(
-                        f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
-                    )
-                denorm_actions[action_name] = denorm_action
+                    batch = {
+                        "action": action_btd,
+                        "state": proprio,
+                    }
+                    batch = processor.action_state_merger.backward(batch)
+                    batch = processor.normalizer.backward(batch)
+                    merged_batch = {
+                        "action": {meta["key"]: batch["action"][meta["key"]].squeeze(0) for meta in action_meta},
+                        "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
+                    }
+                    merged_batch = processor.action_state_merger.forward(merged_batch)
+                    denorm_action = merged_batch["action"].unsqueeze(0)
+                    if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
+                        raise ValueError(
+                            f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
+                        )
+                    denorm_actions[action_name] = denorm_action
 
             pred_action_denorm = denorm_actions["pred"]
             gt_action_denorm = denorm_actions["gt"]

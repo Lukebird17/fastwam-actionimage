@@ -1,0 +1,53 @@
+train:
+  _target_: fastwam.datasets.robotwin.RoboTwinActionImageDataset
+  dataset_root: ./data/RoboTwin2.0/dataset
+  num_frames: 33
+  action_video_freq_ratio: 4
+  global_sample_stride: 1
+  window_stride: 1
+  include_padded_tail: false
+  tasks: null
+  embodiments:
+    - aloha-agilex_clean_50
+    - aloha-agilex_randomized_500
+  split: train
+  val_set_proportion: 0.01
+  split_seed: 42
+  instruction_set: seen
+  instruction_index: 0
+  action_fov_scale: 1.0
+  action_axis_length: 0.1
+  action_sigma: 0.05
+  include_action_video: false
+  normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
+  text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
+  context_len: 128
+  action_dim: 16
+  proprio_dim: 16
+
+val:
+  _target_: fastwam.datasets.robotwin.RoboTwinActionImageDataset
+  dataset_root: ./data/RoboTwin2.0/dataset
+  num_frames: 33
+  action_video_freq_ratio: 4
+  global_sample_stride: 1
+  window_stride: 1
+  include_padded_tail: false
+  tasks: null
+  embodiments:
+    - aloha-agilex_clean_50
+    - aloha-agilex_randomized_500
+  split: val
+  val_set_proportion: 0.01
+  split_seed: 42
+  instruction_set: seen
+  instruction_index: 0
+  action_fov_scale: 1.0
+  action_axis_length: 0.1
+  action_sigma: 0.05
+  include_action_video: false
+  normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
+  text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
+  context_len: 128
+  action_dim: 16
+  proprio_dim: 16

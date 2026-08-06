@@ -37,6 +37,8 @@ class FastWAM(torch.nn.Module):
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
+        loss_lambda_rgb: float | None = None,
+        loss_lambda_action_image: float | None = None,
         loss_lambda_action: float = 1.0,
     ):
         super().__init__()
@@ -83,6 +85,12 @@ class FastWAM(torch.nn.Module):
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
+        self.loss_lambda_rgb = float(
+            self.loss_lambda_video if loss_lambda_rgb is None else loss_lambda_rgb
+        )
+        self.loss_lambda_action_image = float(
+            self.loss_lambda_video if loss_lambda_action_image is None else loss_lambda_action_image
+        )
         self.loss_lambda_action = float(loss_lambda_action)
 
         self.to(self.device)
@@ -110,6 +118,8 @@ class FastWAM(torch.nn.Module):
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
+        loss_lambda_rgb: float | None = None,
+        loss_lambda_action_image: float | None = None,
         loss_lambda_action: float = 1.0,
     ):
         if video_dit_config is None:
@@ -167,6 +177,8 @@ class FastWAM(torch.nn.Module):
             action_infer_shift=action_infer_shift,
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
+            loss_lambda_rgb=loss_lambda_rgb,
+            loss_lambda_action_image=loss_lambda_action_image,
             loss_lambda_action=loss_lambda_action,
         )
         model.model_paths = {
@@ -241,14 +253,52 @@ class FastWAM(torch.nn.Module):
 
     @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
-        z = self.vae.encode(
-            video_tensor,
-            device=self.device,
-            tiled=tiled,
-            tile_size=tile_size,
-            tile_stride=tile_stride,
+        temporal_factor = int(self.vae.temporal_downsample_factor)
+        num_frames = int(video_tensor.shape[2])
+        if num_frames % temporal_factor == 1:
+            segments = (video_tensor,)
+        elif num_frames % 2 == 0 and (num_frames // 2) % temporal_factor == 1:
+            segments = video_tensor.chunk(2, dim=2)
+        else:
+            raise ValueError(
+                f"Video must be one valid VAE segment or two equal segments, got T={num_frames} "
+                f"with temporal factor {temporal_factor}."
+            )
+        latents = [
+            self.vae.encode(
+                segment,
+                device=self.device,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
+            for segment in segments
+        ]
+        return torch.cat(latents, dim=2)
+
+    def _conditioning_latent_indices(self, num_latent_frames: int) -> tuple[int, ...]:
+        mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
+        if mode == "segment_first_frame_causal":
+            if num_latent_frames % 2:
+                raise ValueError(
+                    "segment_first_frame_causal requires two equal latent segments, "
+                    f"got {num_latent_frames} latent frames."
+                )
+            return (0, num_latent_frames // 2)
+        return (0,)
+
+    def _parse_video_frame_layout(self, num_video_frames: int) -> tuple[bool, int, int]:
+        """Return ``(is_dual_segment, segment_frames, latent_frames)``."""
+        temporal_factor = int(self.vae.temporal_downsample_factor)
+        if num_video_frames % temporal_factor == 1:
+            segment_frames = num_video_frames
+            return False, segment_frames, (segment_frames - 1) // temporal_factor + 1
+        if num_video_frames % 2 == 0 and (num_video_frames // 2) % temporal_factor == 1:
+            segment_frames = num_video_frames // 2
+            return True, segment_frames, 2 * ((segment_frames - 1) // temporal_factor + 1)
+        raise ValueError(
+            f"`num_video_frames` must be one valid segment or two equal valid segments, got {num_video_frames}"
         )
-        return z
 
     @torch.no_grad()
     def _encode_input_image_latents_tensor(self, input_image: torch.Tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -264,8 +314,48 @@ class FastWAM(torch.nn.Module):
             z = z[0].unsqueeze(0)
         return z
 
+    @torch.no_grad()
+    def _encode_conditioning_images(
+        self,
+        input_image: torch.Tensor,
+        input_action_image: Optional[torch.Tensor] = None,
+        tiled: bool = False,
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        scene_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
+        if mode != "segment_first_frame_causal":
+            return scene_latents, (0,)
+        if input_action_image is None:
+            raise ValueError(
+                "`input_action_image` is required when `video_attention_mask_mode='segment_first_frame_causal'`."
+            )
+        action_latents = self._encode_input_image_latents_tensor(
+            input_image=input_action_image, tiled=tiled
+        )
+        return torch.cat([scene_latents, action_latents], dim=2), (0, 1)
+
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
-        video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
+        if mode == "segment_first_frame_causal" and latents.shape[2] % 2 == 0:
+            decoded = [
+                self.vae.decode(
+                    segment,
+                    device=self.device,
+                    tiled=tiled,
+                    tile_size=tile_size,
+                    tile_stride=tile_stride,
+                )
+                for segment in latents.chunk(2, dim=2)
+            ]
+            video_tensor = torch.cat(decoded, dim=2)
+        else:
+            video_tensor = self.vae.decode(
+                latents,
+                device=self.device,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
         video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
         video_tensor = ((video_tensor + 1.0) * 127.5).to(torch.uint8).cpu()
         frames = []
@@ -293,10 +383,16 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"Video spatial dims must be multiples of 16, got H={height}, W={width}"
             )
-        if num_frames % 4 != 1:
-            raise ValueError(f"Video T must satisfy T % 4 == 1, got T={num_frames}")
-        if num_frames <= 1:
-            raise ValueError(f"Video T must be > 1 for action-conditioned training, got T={num_frames}")
+        temporal_factor = int(self.vae.temporal_downsample_factor)
+        is_single_segment = num_frames % temporal_factor == 1
+        is_two_segments = num_frames % 2 == 0 and (num_frames // 2) % temporal_factor == 1
+        if not (is_single_segment or is_two_segments):
+            raise ValueError(
+                f"Video must contain one valid segment or two equal valid segments, got T={num_frames}"
+            )
+        segment_frames = num_frames // 2 if is_two_segments else num_frames
+        if segment_frames <= 1:
+            raise ValueError(f"Each video segment must contain at least 2 frames, got {segment_frames}")
 
         if "action" not in sample:
             raise ValueError("`sample['action']` is required for FastWAM training.")
@@ -305,9 +401,10 @@ class FastWAM(torch.nn.Module):
         if action.ndim != 3:
             raise ValueError(f"`sample['action']` must be 3D [B, T, a_dim], got shape {tuple(action.shape)}")
         action_horizon = int(action.shape[1])
-        if action_horizon % (num_frames - 1) != 0:
+        if action_horizon % (segment_frames - 1) != 0:
             raise ValueError(
-                f"`sample['action']` temporal dimension must be divisible by video transitions ({num_frames - 1}), got {action_horizon}"
+                "`sample['action']` temporal dimension must be divisible by per-segment video "
+                f"transitions ({segment_frames - 1}), got {action_horizon}"
             )
 
         action_is_pad = sample.get("action_is_pad", None)
@@ -337,10 +434,12 @@ class FastWAM(torch.nn.Module):
         input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
-        first_frame_latents = None
+        conditioning_latents = None
+        conditioning_indices: tuple[int, ...] = ()
         fuse_flag = False
         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
-            first_frame_latents = input_latents[:, :, 0:1]
+            conditioning_indices = self._conditioning_latent_indices(input_latents.shape[2])
+            conditioning_latents = input_latents[:, :, conditioning_indices]
             fuse_flag = True
 
         if context.ndim != 3 or context_mask.ndim != 2:
@@ -375,7 +474,8 @@ class FastWAM(torch.nn.Module):
             "context": context,
             "context_mask": context_mask,
             "input_latents": input_latents,
-            "first_frame_latents": first_frame_latents,
+            "conditioning_latents": conditioning_latents,
+            "conditioning_indices": conditioning_indices,
             "fuse_vae_embedding_in_latents": fuse_flag,
             "action": action,
             "action_is_pad": action_is_pad,
@@ -401,9 +501,11 @@ class FastWAM(torch.nn.Module):
         )
         # action -> action
         mask[video_seq_len:, video_seq_len:] = True
-        # action -> first-frame video only
-        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
+        # action -> conditioned video frames only
+        num_latent_frames = video_seq_len // video_tokens_per_frame
+        for frame_index in self._conditioning_latent_indices(num_latent_frames):
+            start = frame_index * video_tokens_per_frame
+            mask[video_seq_len:, start : start + video_tokens_per_frame] = True
         return mask
 
     def _compute_video_loss_per_sample(
@@ -411,29 +513,42 @@ class FastWAM(torch.nn.Module):
         pred_video: torch.Tensor,
         target_video: torch.Tensor,
         image_is_pad: Optional[torch.Tensor],
-        include_initial_video_step: bool,
-    ) -> torch.Tensor:
+        conditioning_indices: tuple[int, ...],
+    ) -> list[torch.Tensor]:
+        """Return one per-sample video loss tensor per RGB / action-image segment."""
         video_loss_token = F.mse_loss(pred_video.float(), target_video.float(), reduction="none").mean(dim=(1, 3, 4))
         if image_is_pad is None:
-            return video_loss_token.mean(dim=1)
+            if video_loss_token.shape[1] % 2 == 0 and len(conditioning_indices) == 2:
+                half = video_loss_token.shape[1] // 2
+                return [video_loss_token[:, :half].mean(dim=1), video_loss_token[:, half:].mean(dim=1)]
+            return [video_loss_token.mean(dim=1)]
 
         temporal_factor = int(self.vae.temporal_downsample_factor)
         if temporal_factor <= 0:
             raise ValueError(f"`vae.temporal_downsample_factor` must be positive, got {temporal_factor}.")
         if image_is_pad.shape[1] < 1:
             raise ValueError("`image_is_pad` must contain at least one frame.")
-        if (image_is_pad.shape[1] - 1) % temporal_factor != 0:
-            raise ValueError(
-                "Cannot align `image_is_pad` with video latent steps: "
-                f"num_frames={image_is_pad.shape[1]}, temporal_downsample_factor={temporal_factor}."
-            )
-
-        tail_is_pad = image_is_pad[:, 1:]
-        latent_tail_is_pad = tail_is_pad.view(image_is_pad.shape[0], -1, temporal_factor).all(dim=2)
-        if include_initial_video_step:
-            video_is_pad = torch.cat([image_is_pad[:, :1], latent_tail_is_pad], dim=1)
+        num_frames = image_is_pad.shape[1]
+        if (num_frames - 1) % temporal_factor == 0:
+            segments = (image_is_pad,)
+        elif num_frames % 2 == 0 and (num_frames // 2 - 1) % temporal_factor == 0:
+            segments = image_is_pad.chunk(2, dim=1)
         else:
-            video_is_pad = latent_tail_is_pad
+            raise ValueError(
+                "Cannot align `image_is_pad` with one or two video segments: "
+                f"num_frames={num_frames}, temporal_downsample_factor={temporal_factor}."
+            )
+        latent_pad_segments = []
+        for segment in segments:
+            latent_tail_is_pad = segment[:, 1:].view(
+                segment.shape[0], -1, temporal_factor
+            ).all(dim=2)
+            latent_pad_segments.append(torch.cat([segment[:, :1], latent_tail_is_pad], dim=1))
+        video_is_pad = torch.cat(latent_pad_segments, dim=1)
+        if conditioning_indices:
+            keep = torch.ones(video_is_pad.shape[1], dtype=torch.bool, device=video_is_pad.device)
+            keep[list(conditioning_indices)] = False
+            video_is_pad = video_is_pad[:, keep]
 
         if video_is_pad.shape[1] != video_loss_token.shape[1]:
             raise ValueError(
@@ -442,8 +557,22 @@ class FastWAM(torch.nn.Module):
             )
 
         valid = (~video_is_pad).to(device=video_loss_token.device, dtype=video_loss_token.dtype)
-        valid_sum = valid.sum(dim=1).clamp(min=1.0)
-        return (video_loss_token * valid).sum(dim=1) / valid_sum
+        if len(segments) == 1:
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)
+            return [(video_loss_token * valid).sum(dim=1) / valid_sum]
+
+        if video_loss_token.shape[1] % 2 != 0:
+            raise ValueError(
+                "Dual-segment video loss expects an even number of supervised latent steps, "
+                f"got {video_loss_token.shape[1]}."
+            )
+        half = video_loss_token.shape[1] // 2
+        segment_losses = []
+        for start, end in ((0, half), (half, video_loss_token.shape[1])):
+            token = video_loss_token[:, start:end]
+            segment_valid = valid[:, start:end]
+            segment_losses.append((token * segment_valid).sum(dim=1) / segment_valid.sum(dim=1).clamp(min=1.0))
+        return segment_losses
 
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
@@ -464,8 +593,8 @@ class FastWAM(torch.nn.Module):
         latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
 
-        if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+        if inputs["conditioning_latents"] is not None:
+            latents[:, :, inputs["conditioning_indices"]] = inputs["conditioning_latents"]
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -531,21 +660,24 @@ class FastWAM(torch.nn.Module):
 
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+        if inputs["conditioning_indices"]:
+            keep = torch.ones(pred_video.shape[2], dtype=torch.bool, device=pred_video.device)
+            keep[list(inputs["conditioning_indices"])] = False
+            pred_video = pred_video[:, :, keep]
+            target_video = target_video[:, :, keep]
 
-        loss_video_per_sample = self._compute_video_loss_per_sample(
+        segment_losses = self._compute_video_loss_per_sample(
             pred_video=pred_video,
             target_video=target_video,
             image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
+            conditioning_indices=inputs["conditioning_indices"],
         )
         video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
-            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+            segment_losses[0].device, dtype=segment_losses[0].dtype
         )
-        loss_video = (loss_video_per_sample * video_weight).mean()
+        weighted_segments = [(loss * video_weight).mean() for loss in segment_losses]
+        loss_rgb = weighted_segments[0]
+        loss_action_image = weighted_segments[1] if len(weighted_segments) > 1 else None
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
         if action_is_pad is not None:
@@ -560,11 +692,19 @@ class FastWAM(torch.nn.Module):
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
 
-        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        loss_total = self.loss_lambda_rgb * loss_rgb + self.loss_lambda_action * loss_action
         loss_dict = {
-            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_rgb": self.loss_lambda_rgb * float(loss_rgb.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        if loss_action_image is not None:
+            loss_total = loss_total + self.loss_lambda_action_image * loss_action_image
+            loss_dict["loss_action_image"] = (
+                self.loss_lambda_action_image * float(loss_action_image.detach().item())
+            )
+            loss_dict["loss_video"] = loss_dict["loss_rgb"] + loss_dict["loss_action_image"]
+        else:
+            loss_dict["loss_video"] = loss_dict["loss_rgb"]
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -733,6 +873,7 @@ class FastWAM(torch.nn.Module):
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        input_action_image: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
@@ -752,6 +893,9 @@ class FastWAM(torch.nn.Module):
                 action_horizon=action_horizon,
                 context=context.clone() if context is not None else None,
                 context_mask=context_mask.clone() if context_mask is not None else None,
+                input_action_image=(
+                    input_action_image.clone() if input_action_image is not None else None
+                ),
                 num_inference_steps=num_inference_steps,
                 sigma_shift=sigma_shift,
                 seed=seed,
@@ -767,15 +911,11 @@ class FastWAM(torch.nn.Module):
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
         _, _, height, width = input_image.shape
-        checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
-        if (checked_h, checked_w) != (height, width):
+        if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
                 f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
             )
-        if checked_t != num_video_frames:
-            raise ValueError(
-                f"`num_video_frames` must satisfy T % 4 == 1, got {num_video_frames}"
-            )
+        is_dual_segment, segment_frames, latent_t = self._parse_video_frame_layout(num_video_frames)
         if action is not None:
             if action.ndim == 2:
                 action = action.unsqueeze(0)
@@ -798,7 +938,6 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
-        latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
@@ -818,8 +957,30 @@ class FastWAM(torch.nn.Module):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        if input_action_image is not None:
+            if input_action_image.ndim == 3:
+                input_action_image = input_action_image.unsqueeze(0)
+            input_action_image = input_action_image.to(device=self.device, dtype=self.torch_dtype)
+        conditioning_latents, _ = self._encode_conditioning_images(
+            input_image=input_image,
+            input_action_image=input_action_image,
+            tiled=tiled,
+        )
+        if is_dual_segment:
+            conditioning_indices = self._conditioning_latent_indices(latent_t)
+            if len(conditioning_indices) != conditioning_latents.shape[2]:
+                raise ValueError(
+                    "Dual-segment inference expects one conditioning latent per segment, "
+                    f"got indices={conditioning_indices} and cond={tuple(conditioning_latents.shape)}"
+                )
+        else:
+            conditioning_indices = (0,)
+            if conditioning_latents.shape[2] != 1:
+                raise ValueError(
+                    f"Single-segment inference expects one conditioning latent, got {tuple(conditioning_latents.shape)}"
+                )
+        for src, dst in enumerate(conditioning_indices):
+            latents_video[:, :, dst:dst + 1] = conditioning_latents[:, :, src:src + 1].clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -887,7 +1048,8 @@ class FastWAM(torch.nn.Module):
 
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            for src, dst in enumerate(conditioning_indices):
+                latents_video[:, :, dst:dst + 1] = conditioning_latents[:, :, src:src + 1].clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
         if test_action_with_infer_action:
@@ -911,6 +1073,7 @@ class FastWAM(torch.nn.Module):
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        input_action_image: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
@@ -920,9 +1083,11 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
     ) -> dict[str, Any]:
         self.eval()
-        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+        mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
+        if mode not in {"first_frame_causal", "segment_first_frame_causal"}:
             raise ValueError(
-                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
+                "`infer_action` requires `video_attention_mask_mode` in "
+                "{'first_frame_causal', 'segment_first_frame_causal'}."
             )
 
         if input_image.ndim == 3:
@@ -958,7 +1123,15 @@ class FastWAM(torch.nn.Module):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        if input_action_image is not None:
+            if input_action_image.ndim == 3:
+                input_action_image = input_action_image.unsqueeze(0)
+            input_action_image = input_action_image.to(device=self.device, dtype=self.torch_dtype)
+        conditioning_latents, _ = self._encode_conditioning_images(
+            input_image=input_image,
+            input_action_image=input_action_image,
+            tiled=tiled,
+        )
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -991,12 +1164,12 @@ class FastWAM(torch.nn.Module):
             )
 
         timestep_video = torch.zeros(
-            (first_frame_latents.shape[0],),
-            dtype=first_frame_latents.dtype,
+            (conditioning_latents.shape[0],),
+            dtype=conditioning_latents.dtype,
             device=self.device,
         )
         video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
+            x=conditioning_latents,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
@@ -1058,6 +1231,7 @@ class FastWAM(torch.nn.Module):
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        input_action_image: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 5.0,
         action_cfg_scale: float = 1.0,
@@ -1076,6 +1250,7 @@ class FastWAM(torch.nn.Module):
             proprio=proprio,
             context=context,
             context_mask=context_mask,
+            input_action_image=input_action_image,
             negative_prompt=negative_prompt,
             text_cfg_scale=text_cfg_scale,
             num_inference_steps=num_inference_steps,

@@ -9,6 +9,12 @@ runs
 runs/
 evaluate_results/
 .deepspeed*
+data
+!configs/data/
+!configs/data/*.yaml
+logs
+third_party/RoboTwin/assets
+.tmp_*
 
 
 # ai coding

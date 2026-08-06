@@ -59,6 +59,7 @@ class FastWAMJoint(FastWAM):
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        input_action_image: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
@@ -82,6 +83,7 @@ class FastWAMJoint(FastWAM):
             proprio=proprio,
             context=context,
             context_mask=context_mask,
+            input_action_image=input_action_image,
             negative_prompt=negative_prompt,
             text_cfg_scale=text_cfg_scale,
             num_inference_steps=num_inference_steps,
@@ -102,6 +104,7 @@ class FastWAMJoint(FastWAM):
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        input_action_image: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
@@ -110,6 +113,12 @@ class FastWAMJoint(FastWAM):
         rand_device: str = "cpu",
         tiled: bool = False,
     ) -> dict[str, Any]:
+        """Joint video+action denoise; returns only the action chunk.
+
+        Unlike base ``FastWAM.infer_action`` (KV-cache over conditioning frames only),
+        this path denoises a full video trajectory because action attends to all video
+        tokens.
+        """
         self.eval()
 
         if input_image.ndim == 3:
@@ -119,15 +128,11 @@ class FastWAMJoint(FastWAM):
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
         _, _, height, width = input_image.shape
-        checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
-        if (checked_h, checked_w) != (height, width):
+        if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
                 f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
             )
-        if checked_t != num_video_frames:
-            raise ValueError(
-                f"`num_video_frames` must satisfy T % 4 == 1, got {num_video_frames}"
-            )
+        is_dual_segment, _, latent_t = self._parse_video_frame_layout(num_video_frames)
 
         if proprio is not None:
             if self.proprio_dim is None:
@@ -142,7 +147,6 @@ class FastWAMJoint(FastWAM):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
-        latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
@@ -162,8 +166,30 @@ class FastWAMJoint(FastWAM):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        if input_action_image is not None:
+            if input_action_image.ndim == 3:
+                input_action_image = input_action_image.unsqueeze(0)
+            input_action_image = input_action_image.to(device=self.device, dtype=self.torch_dtype)
+        conditioning_latents, _ = self._encode_conditioning_images(
+            input_image=input_image,
+            input_action_image=input_action_image,
+            tiled=tiled,
+        )
+        if is_dual_segment:
+            conditioning_indices = self._conditioning_latent_indices(latent_t)
+            if len(conditioning_indices) != conditioning_latents.shape[2]:
+                raise ValueError(
+                    "Dual-segment inference expects one conditioning latent per segment, "
+                    f"got indices={conditioning_indices} and cond={tuple(conditioning_latents.shape)}"
+                )
+        else:
+            conditioning_indices = (0,)
+            if conditioning_latents.shape[2] != 1:
+                raise ValueError(
+                    f"Single-segment inference expects one conditioning latent, got {tuple(conditioning_latents.shape)}"
+                )
+        for src, dst in enumerate(conditioning_indices):
+            latents_video[:, :, dst:dst + 1] = conditioning_latents[:, :, src:src + 1].clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -229,7 +255,8 @@ class FastWAMJoint(FastWAM):
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            for src, dst in enumerate(conditioning_indices):
+                latents_video[:, :, dst:dst + 1] = conditioning_latents[:, :, src:src + 1].clone()
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),

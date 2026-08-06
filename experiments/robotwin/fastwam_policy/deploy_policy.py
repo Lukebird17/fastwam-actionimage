@@ -1,8 +1,11 @@
+"""FastWAM policy adapter for RoboTwin closed-loop evaluation."""
+
+from __future__ import annotations
+
 import logging
 import os
 import sys
 import time
-import inspect
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -13,7 +16,6 @@ from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -23,9 +25,13 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
-from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.datasets.robotwin.obs_utils import (
+    compose_robotwin_rgb_tensor,
+    endpose_dict_to_action_16d,
+    render_action_image_tensor,
+)
+from fastwam.datasets.robotwin.raw_dataset import DEFAULT_PROMPT
+from fastwam.datasets.robotwin.wrist_mounts import resolve_wrist_cam_from_ee
 
 logger = logging.getLogger(__name__)
 
@@ -117,29 +123,42 @@ def _compose_sim_cfg(
     return cfg
 
 
-def _resolve_dataset_stats_path(dataset_stats_path: Optional[str]) -> Path:
-    if _is_none_like(dataset_stats_path):
-        raise FileNotFoundError(
-            "`dataset_stats_path` is required. "
-            "Please pass it from eval entrypoint overrides."
-        )
-    resolved = Path(str(dataset_stats_path)).expanduser().resolve()
-    if not resolved.exists():
-        raise FileNotFoundError(f"Dataset stats path not found: {resolved}")
-    return resolved
+def _resolve_dataset_stats_path(dataset_stats_path: Optional[str], cfg: DictConfig) -> Path:
+    candidates = []
+    if not _is_none_like(dataset_stats_path):
+        candidates.append(Path(str(dataset_stats_path)).expanduser())
+    stats = cfg.data.train.get("normalization_stats")
+    if not _is_none_like(stats):
+        candidates.append(Path(str(stats)).expanduser())
+    for path in candidates:
+        resolved = path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+        if resolved.exists():
+            return resolved
+    raise FileNotFoundError(
+        f"Could not resolve 16D action stats. Tried: {candidates}. "
+        "Pass EVALUATION.dataset_stats_path or set data.train.normalization_stats."
+    )
 
 
-def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
-    pil_image = Image.fromarray(image.astype(np.uint8), mode="RGB")
-    resized = pil_image.resize(size_wh, resample=Image.BILINEAR)
-    return np.asarray(resized, dtype=np.uint8)
+def _load_action_stats(path: Path) -> tuple[torch.Tensor, torch.Tensor]:
+    import json
+
+    with path.open() as file:
+        payload = json.load(file)
+    mean = torch.tensor(payload["mean"], dtype=torch.float32)
+    std = torch.tensor(payload["std"], dtype=torch.float32).clamp_min(1e-6)
+    if mean.shape != (16,) or std.shape != (16,):
+        raise ValueError(f"Expected 16D mean/std in {path}, got {tuple(mean.shape)}/{tuple(std.shape)}")
+    return mean, std
 
 
 class WorldActionRobotWinPolicy:
+    """Closed-loop policy for action-image FastWAM checkpoints (16D ee)."""
+
     def __init__(
         self,
         model_cfg: DictConfig,
-        processor_cfg: DictConfig,
+        data_cfg: DictConfig,
         checkpoint_path: str,
         dataset_stats_path: Path,
         device: str,
@@ -154,7 +173,6 @@ class WorldActionRobotWinPolicy:
         rand_device: str,
         tiled: bool,
         timing_enabled: bool,
-        num_video_frames: int,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -163,9 +181,15 @@ class WorldActionRobotWinPolicy:
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
 
-        self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
-        dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
-        self.processor.set_normalizer_from_stats(dataset_stats)
+        self.action_mean, self.action_std = _load_action_stats(dataset_stats_path)
+        self.action_fov_scale = float(data_cfg.train.get("action_fov_scale", 1.0))
+        self.action_axis_length = float(data_cfg.train.get("action_axis_length", 0.1))
+        self.action_sigma = float(data_cfg.train.get("action_sigma", 0.05))
+        self.wrist_look_distance = float(data_cfg.train.get("wrist_look_distance", 0.25))
+        self.wrist_cam_from_ee = resolve_wrist_cam_from_ee(
+            data_cfg.train.get("wrist_cam_from_ee"),
+            embodiment="aloha-agilex",
+        )
 
         self.action_horizon = int(action_horizon)
         self.replan_steps = int(max(1, min(replan_steps, action_horizon)))
@@ -177,7 +201,6 @@ class WorldActionRobotWinPolicy:
         self.rand_device = str(rand_device)
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
-        self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
@@ -185,63 +208,50 @@ class WorldActionRobotWinPolicy:
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized action-image RoboTwin policy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
         )
 
-    def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
-        state_meta = self.processor.shape_meta["state"]
-        if len(state_meta) != 1:
-            raise ValueError("Expected exactly one merged state key in shape_meta['state'].")
-        state_key = state_meta[0]["key"]
-
-        state_batch = {"state": {state_key: torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)}}
-        state_batch = self.processor.action_state_transform(state_batch)
-        state_batch = self.processor.normalizer.forward(state_batch)
-        return state_batch["state"][state_key]
+    def _normalize_action(self, action: np.ndarray) -> torch.Tensor:
+        action_t = torch.as_tensor(action, dtype=torch.float32)
+        return (action_t - self.action_mean) / self.action_std
 
     def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
+        action = action.detach().to(dtype=torch.float32, device="cpu")
         if action.ndim == 2:
             action = action.unsqueeze(0)
-        if action.ndim != 3:
-            raise ValueError(f"Expected action tensor [B,T,D], got {tuple(action.shape)}")
-
-        action_meta = self.processor.shape_meta["action"]
-        if len(action_meta) != 1:
-            raise ValueError("Expected exactly one merged action key in shape_meta['action'].")
-
-        action_key = action_meta[0]["key"]
-        normalizer = self.processor.normalizer.normalizers["action"][action_key]
-        denorm = normalizer.backward(action.to(dtype=torch.float32, device="cpu"))
+        denorm = action * self.action_std + self.action_mean
         return denorm.numpy()
 
-    def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
-        obs_data = observation["observation"]
-        head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
-        left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
-        right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
-        bottom = np.concatenate([left, right], axis=1)
-        image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
-
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
-            device=self.model.device,
-            dtype=self.model.torch_dtype,
-        )
-        image_tensor = image_tensor * (2.0 / 255.0) - 1.0
-        return image_tensor
-
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
-        image_tensor = self._build_robotwin_image_tensor(observation)
-        state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
-        proprio = self._normalize_state(state_vector)
+        if "endpose" not in observation:
+            raise KeyError(
+                "Observation is missing `endpose`. Enable data_type.endpose in the RoboTwin task config."
+            )
+        action_16d = endpose_dict_to_action_16d(observation["endpose"])
+        proprio = self._normalize_action(action_16d)
+
+        image_tensor = compose_robotwin_rgb_tensor(observation).to(
+            device=self.model.device, dtype=self.model.torch_dtype
+        )
+        action_image = render_action_image_tensor(
+            observation,
+            action_16d,
+            action_fov_scale=self.action_fov_scale,
+            action_axis_length=self.action_axis_length,
+            action_sigma=self.action_sigma,
+            wrist_look_distance=self.wrist_look_distance,
+            wrist_cam_from_ee=self.wrist_cam_from_ee,
+        ).to(device=self.model.device, dtype=self.model.torch_dtype)
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
         infer_kwargs = {
             "prompt": prompt,
             "input_image": image_tensor,
+            "input_action_image": action_image,
             "action_horizon": self.action_horizon,
             "proprio": proprio,
             "negative_prompt": self.negative_prompt,
@@ -252,17 +262,13 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
-        if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
-            infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
-        action_tensor = pred["action"]  # [T, D]
-        action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
-        return action_chunk
+        return self._denormalize_action(pred["action"])[0]
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
@@ -289,7 +295,7 @@ class WorldActionRobotWinPolicy:
 
         action = self.pending_actions.popleft()
         sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
-        task_env.take_action(action, action_type="qpos")
+        task_env.take_action(action, action_type="ee")
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
         self.step_count += 1
@@ -316,13 +322,10 @@ def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
 
 
 def get_model(usr_args: Dict[str, Any]):
-    sim_cfg_path = usr_args.get("sim_cfg_path")
-    sim_cfg_name = usr_args.get("sim_cfg_name")
-    sim_task = usr_args.get("sim_task")
     cfg = _compose_sim_cfg(
-        sim_cfg_path=sim_cfg_path,
-        sim_cfg_name=sim_cfg_name,
-        sim_task=sim_task,
+        sim_cfg_path=usr_args.get("sim_cfg_path"),
+        sim_cfg_name=usr_args.get("sim_cfg_name"),
+        sim_task=usr_args.get("sim_task"),
     )
 
     checkpoint_path = usr_args.get("ckpt_setting")
@@ -336,9 +339,9 @@ def get_model(usr_args: Dict[str, Any]):
 
     mixed_precision = str(usr_args.get("mixed_precision") or cfg.get("mixed_precision", "bf16"))
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
-
     dataset_stats_path = _resolve_dataset_stats_path(
-        dataset_stats_path=usr_args.get("dataset_stats_path"),
+        dataset_stats_path=usr_args.get("dataset_stats_path") or cfg.EVALUATION.get("dataset_stats_path"),
+        cfg=cfg,
     )
 
     action_horizon = _parse_optional_int(usr_args.get("action_horizon"))
@@ -360,18 +363,9 @@ def get_model(usr_args: Dict[str, Any]):
     if sigma_shift is None:
         sigma_shift = _parse_optional_float(cfg.EVALUATION.get("sigma_shift"))
 
-    seed = _parse_optional_int(usr_args.get("seed"))
-    text_cfg_scale = float(usr_args.get("text_cfg_scale", cfg.EVALUATION.get("text_cfg_scale", 1.0)))
-    negative_prompt = str(usr_args.get("negative_prompt", cfg.EVALUATION.get("negative_prompt", "")))
-    rand_device = str(usr_args.get("rand_device", cfg.EVALUATION.get("rand_device", "cpu")))
-    tiled = _parse_bool(usr_args.get("tiled", cfg.EVALUATION.get("tiled", False)))
-    timing_enabled = _parse_bool(
-        usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
-    )
-
-    policy = WorldActionRobotWinPolicy(
+    return WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
-        processor_cfg=cfg.data.train.processor,
+        data_cfg=cfg.data,
         checkpoint_path=str(checkpoint_path),
         dataset_stats_path=dataset_stats_path,
         device=device,
@@ -380,15 +374,15 @@ def get_model(usr_args: Dict[str, Any]):
         replan_steps=replan_steps,
         num_inference_steps=num_inference_steps,
         sigma_shift=sigma_shift,
-        seed=seed,
-        text_cfg_scale=text_cfg_scale,
-        negative_prompt=negative_prompt,
-        rand_device=rand_device,
-        tiled=tiled,
-        timing_enabled=timing_enabled,
-        num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        seed=_parse_optional_int(usr_args.get("seed")),
+        text_cfg_scale=float(usr_args.get("text_cfg_scale", cfg.EVALUATION.get("text_cfg_scale", 1.0))),
+        negative_prompt=str(usr_args.get("negative_prompt", cfg.EVALUATION.get("negative_prompt", ""))),
+        rand_device=str(usr_args.get("rand_device", cfg.EVALUATION.get("rand_device", "cpu"))),
+        tiled=_parse_bool(usr_args.get("tiled", cfg.EVALUATION.get("tiled", False))),
+        timing_enabled=_parse_bool(
+            usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
+        ),
     )
-    return policy
 
 
 def eval(TASK_ENV, model, observation: Optional[Dict[str, Any]]):

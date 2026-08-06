@@ -2,7 +2,7 @@
 
 defaults:
   - train
-  - override /task: robotwin_uncond_3cam_384_1e-4
+  - override /task: robotwin_action_image_3cam_384_1e-4
   - _self_
 
 ckpt: null
@@ -18,11 +18,11 @@ EVALUATION:
   policy_name: fastwam_policy
   task_name: null
   task_config: demo_randomized
-  instruction_type: unseen
+  instruction_type: seen
   eval_num_episodes: 100
   output_dir: ./evaluate_results/robotwin/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
 
-  # Action inference
+  # Action inference (16D ee + action-image conditioning)
   action_horizon: null
   replan_steps: 24
   num_inference_steps: ${eval_num_inference_steps}
@@ -32,10 +32,10 @@ EVALUATION:
   rand_device: cpu
   tiled: false
   timing_enabled: false
-  skip_get_obs_within_replan: true
+  skip_get_obs_within_replan: false
 
   # Runtime inputs
-  dataset_stats_path: null
+  dataset_stats_path: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   device: cuda
 
 MULTIRUN:

@@ -1,0 +1,42 @@
+# @package _global_
+#
+# Experiment (2): FastWAM + action images on the poker task, 1 node x 4 GPUs.
+#
+# The treatment arm. This is `robotwin_action_image_3cam_384_1e-4.yaml` narrowed to
+# one task and resized for 4 GPUs -- deliberately NOT retuned. In particular our
+# own validated deltas are left OUT of this first round so the comparison measures
+# the senior's fusion as written:
+#   * `action_fov_scale` stays 1.0 (we use 3.0 in ActionImages-Dex),
+#   * no gripper BCE,
+#   * no logit-normal timestep sampling (shift=5 phi sampling is kept).
+#
+# Effective batch matches the control arm and the senior's 2x8 reference:
+#   1 node x 4 GPUs x batch_size 8 x grad_accum 4 = 128.
+defaults:
+  - override /data: robotwin_action_image
+  - override /model: fastwam_action_image
+  - _self_
+
+batch_size: 8
+num_workers: 8
+
+data:
+  train:
+    tasks: [move_playingcard_away]
+  val:
+    tasks: [move_playingcard_away]
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+lr_scheduler_type: cosine
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 2500
+
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null

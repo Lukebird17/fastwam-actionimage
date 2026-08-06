@@ -13,7 +13,7 @@ import torch.distributed as dist
 from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.datasets.robotwin.raw_dataset import ALOHA_EMBODIMENTS, DEFAULT_PROMPT
 from fastwam.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
 from fastwam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 from fastwam.utils.config_resolvers import register_default_resolvers
@@ -58,7 +58,12 @@ def _to_bool(value: Any) -> bool:
 
 def _iter_dataset_nodes(node: Any, path: str = "data"):
     if isinstance(node, DictConfig):
-        if "dataset_dirs" in node and node.get("dataset_dirs") is not None:
+        if (
+            "dataset_dirs" in node
+            and node.get("dataset_dirs") is not None
+            or "dataset_root" in node
+            and node.get("dataset_root") is not None
+        ):
             yield path, node
         for key, value in node.items():
             yield from _iter_dataset_nodes(value, f"{path}.{key}")
@@ -69,25 +74,26 @@ def _iter_dataset_nodes(node: Any, path: str = "data"):
 
 def _collect_dataset_settings(data_cfg: DictConfig):
     dataset_dirs: list[str] = []
+    raw_dataset_nodes: list[DictConfig] = []
     cache_dirs: list[Path] = []
     context_lens = set()
 
     for node_path, node in _iter_dataset_nodes(data_cfg, path="data"):
-        raw_dirs = node.get("dataset_dirs")
-        if raw_dirs is None:
-            continue
-
         cache_dir = node.get("text_embedding_cache_dir")
         if cache_dir is None or not str(cache_dir).strip():
             raise ValueError(
                 f"Missing `text_embedding_cache_dir` for dataset node `{node_path}` "
-                "(this node defines `dataset_dirs`)."
+                "(this node defines a dataset source)."
             )
 
-        for ds in raw_dirs:
-            ds_str = str(ds)
-            if ds_str not in dataset_dirs:
-                dataset_dirs.append(ds_str)
+        raw_dirs = node.get("dataset_dirs")
+        if raw_dirs is not None:
+            for ds in raw_dirs:
+                ds_str = str(ds)
+                if ds_str not in dataset_dirs:
+                    dataset_dirs.append(ds_str)
+        if node.get("dataset_root") is not None:
+            raw_dataset_nodes.append(node)
 
         cache_dir_path = Path(str(cache_dir)).expanduser()
         if cache_dir_path not in cache_dirs:
@@ -97,9 +103,9 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         if context_len is not None:
             context_lens.add(int(context_len))
 
-        logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
+        logger.info("Discovered dataset node `%s`.", node_path)
 
-    return dataset_dirs, cache_dirs, context_lens
+    return dataset_dirs, raw_dataset_nodes, cache_dirs, context_lens
 
 
 def _resolve_context_len(context_lens: set[int]) -> int:
@@ -145,6 +151,33 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     return prompts
 
 
+def _read_unique_raw_robotwin_prompts(nodes: list[DictConfig]) -> list[str]:
+    prompts = []
+    seen = set()
+    visited_files = set()
+    for node in nodes:
+        root = Path(str(node.dataset_root)).expanduser()
+        tasks = set(str(task) for task in node.get("tasks", []) or [])
+        embodiments = set(str(name) for name in node.get("embodiments", []) or ALOHA_EMBODIMENTS)
+        instruction_set = str(node.get("instruction_set", "seen"))
+        instruction_index = int(node.get("instruction_index", 0))
+        for path in sorted(root.glob("*/*/instructions/episode*.json")):
+            if path in visited_files:
+                continue
+            task, embodiment = path.parents[2].name, path.parents[1].name
+            if tasks and task not in tasks or embodiment not in embodiments:
+                continue
+            visited_files.add(path)
+            with path.open() as file:
+                choices = json.load(file)[instruction_set]
+            prompt = DEFAULT_PROMPT.format(task=choices[instruction_index % len(choices)])
+            if prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
+    logger.info("Loaded %d unique prompts from %d raw RoboTwin instruction files.", len(prompts), len(visited_files))
+    return prompts
+
+
 def _get_override_prompt(override_instruction: Any) -> str | None:
     if override_instruction is None:
         return None
@@ -187,7 +220,7 @@ def main(cfg: DictConfig):
     if cfg.data is None:
         raise ValueError("`cfg.data` is required.")
 
-    dataset_dirs, cache_dirs, context_lens = _collect_dataset_settings(cfg.data)
+    dataset_dirs, raw_dataset_nodes, cache_dirs, context_lens = _collect_dataset_settings(cfg.data)
     if not cache_dirs:
         raise ValueError("No `text_embedding_cache_dir` found under `cfg.data`.")
 
@@ -197,9 +230,11 @@ def main(cfg: DictConfig):
         prompts = [override_prompt]
         logger.info("Using override_instruction; skipping dataset scan and encoding exactly 1 prompt.")
     else:
-        if not dataset_dirs:
-            raise ValueError("No `dataset_dirs` found under `cfg.data`.")
+        if not dataset_dirs and not raw_dataset_nodes:
+            raise ValueError("No dataset sources found under `cfg.data`.")
         prompts = _read_unique_prompts(dataset_dirs)
+        raw_prompts = _read_unique_raw_robotwin_prompts(raw_dataset_nodes)
+        prompts = list(dict.fromkeys([*prompts, *raw_prompts]))
     if not prompts:
         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
         return

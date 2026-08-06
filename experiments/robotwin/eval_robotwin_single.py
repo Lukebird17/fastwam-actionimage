@@ -66,8 +66,17 @@ def _resolve_dataset_stats_path(cfg: DictConfig, ckpt_path: Path) -> Path:
     if explicit is not None:
         candidates.append(explicit)
 
+    train_stats = None
+    if OmegaConf.select(cfg, "data.train.normalization_stats", default=None) is not None:
+        train_stats = _resolve_optional_path(cfg.data.train.normalization_stats, base=PROJECT_ROOT)
+    if train_stats is not None:
+        candidates.append(train_stats)
+
+    candidates.append((PROJECT_ROOT / "data" / "RoboTwin2.0" / "aloha_action_16d_stats.json").resolve())
+
     for parent in list(ckpt_path.parents)[:4]:
         candidates.append((parent / "dataset_stats.json").resolve())
+        candidates.append((parent / "aloha_action_16d_stats.json").resolve())
 
     seen: set[Path] = set()
     for path in candidates:
@@ -79,9 +88,10 @@ def _resolve_dataset_stats_path(cfg: DictConfig, ckpt_path: Path) -> Path:
             return resolved
 
     raise FileNotFoundError(
-        "Failed to locate dataset_stats.json. Tried explicit "
-        "EVALUATION.dataset_stats_path and checkpoint parent directories. "
-        "Please pass EVALUATION.dataset_stats_path=/path/to/dataset_stats.json."
+        "Failed to locate 16D action stats. Tried EVALUATION.dataset_stats_path, "
+        "data.train.normalization_stats, data/RoboTwin2.0/aloha_action_16d_stats.json, "
+        "and checkpoint parent directories. "
+        "Please pass EVALUATION.dataset_stats_path=/path/to/aloha_action_16d_stats.json."
     )
 
 

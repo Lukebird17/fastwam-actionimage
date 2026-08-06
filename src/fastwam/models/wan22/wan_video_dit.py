@@ -503,6 +503,21 @@ class WanVideoDiT(torch.nn.Module):
             first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
             video_mask[:first_frame_tokens, first_frame_tokens:] = False
             return video_mask
+        if self.video_attention_mask_mode == "segment_first_frame_causal":
+            if video_seq_len % video_tokens_per_frame:
+                raise ValueError("Video sequence length must contain complete latent frames.")
+            num_frames = video_seq_len // video_tokens_per_frame
+            if num_frames % 2:
+                raise ValueError(
+                    "segment_first_frame_causal requires two equal latent segments, "
+                    f"got {num_frames} latent frames."
+                )
+            video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
+            for frame_index in (0, num_frames // 2):
+                start = frame_index * video_tokens_per_frame
+                end = start + video_tokens_per_frame
+                video_mask[start:end, end:] = False
+            return video_mask
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
 
@@ -543,7 +558,16 @@ class WanVideoDiT(torch.nn.Module):
                 dtype=timestep.dtype,
                 device=timestep.device,
             ) * timestep.view(batch_size, 1, 1)
-            token_timesteps[:, 0, :] = 0
+            if self.video_attention_mask_mode == "segment_first_frame_causal":
+                if x.shape[2] % 2:
+                    raise ValueError(
+                        "segment_first_frame_causal requires two equal latent segments, "
+                        f"got {x.shape[2]} latent frames."
+                    )
+                conditioning_indices = (0, x.shape[2] // 2)
+            else:
+                conditioning_indices = (0,)
+            token_timesteps[:, conditioning_indices, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
             token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
             t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)

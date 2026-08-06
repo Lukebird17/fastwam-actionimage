@@ -334,6 +334,60 @@ class FastWAM(torch.nn.Module):
         )
         return torch.cat([scene_latents, action_latents], dim=2), (0, 1)
 
+    @torch.no_grad()
+    def _build_conditioning_latent_grid(
+        self,
+        input_image: torch.Tensor,
+        input_action_image: Optional[torch.Tensor],
+        latent_t: int,
+        generator: Optional[torch.Generator] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        """Place the conditioning latents on the training-sized latent grid.
+
+        The conditioning latents must sit at the temporal indices the model was
+        trained with, because 3D RoPE encodes a token's frame index into its
+        query/key. Training builds `cat(scene_9f, action_9f)`, which the VAE
+        encodes per segment into `latent_t=6` with pins at `(0, 3)`. Encoding the
+        two conditioning stills into a bare `latent_t=2` tensor instead would put
+        the action-image pin at temporal position 1, i.e. a position the action
+        expert never saw it at, and silently degrades closed-loop behaviour while
+        every offline metric still improves.
+
+        Non-conditioning frames are pure noise, matching the `sigma -> 1` end of
+        the flow-matching schedule. They exist only to give the pins their correct
+        RoPE positions and to fill out the attention neighbourhood the trained
+        mask defines; `patch_size[0] == 1` means no token mixes two latent frames,
+        so they cannot bleed into the pinned frames' own content.
+        """
+        conditioning_latents, _ = self._encode_conditioning_images(
+            input_image=input_image,
+            input_action_image=input_action_image,
+            tiled=tiled,
+        )
+        conditioning_indices = self._conditioning_latent_indices(latent_t)
+        if len(conditioning_indices) != conditioning_latents.shape[2]:
+            raise ValueError(
+                "Expected one conditioning latent per pinned frame, got "
+                f"indices={conditioning_indices} and cond={tuple(conditioning_latents.shape)}"
+            )
+        latents_video = torch.randn(
+            (
+                conditioning_latents.shape[0],
+                conditioning_latents.shape[1],
+                latent_t,
+                conditioning_latents.shape[3],
+                conditioning_latents.shape[4],
+            ),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=conditioning_latents.device, dtype=conditioning_latents.dtype)
+        for src, dst in enumerate(conditioning_indices):
+            latents_video[:, :, dst : dst + 1] = conditioning_latents[:, :, src : src + 1].clone()
+        return latents_video, conditioning_indices
+
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
         if mode == "segment_first_frame_causal" and latents.shape[2] % 2 == 0:
@@ -1085,8 +1139,11 @@ class FastWAM(torch.nn.Module):
     ) -> dict[str, Any]:
         """Infer an action chunk from the segment conditioning frames.
 
-        ``num_video_frames`` is accepted for API parity with ``FastWAMJoint``;
-        the cache-based base model only consumes the conditioning frames.
+        ``num_video_frames`` sizes the latent grid the conditioning frames are
+        pinned into. It is required for ``segment_first_frame_causal``, because
+        the action-image pin's temporal index -- and therefore its 3D RoPE
+        position -- is defined by the training grid, not by the number of
+        conditioning images.
         """
         self.eval()
         mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
@@ -1094,6 +1151,12 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 "`infer_action` requires `video_attention_mask_mode` in "
                 "{'first_frame_causal', 'segment_first_frame_causal'}."
+            )
+        if mode == "segment_first_frame_causal" and num_video_frames is None:
+            raise ValueError(
+                "`num_video_frames` is required when "
+                "`video_attention_mask_mode='segment_first_frame_causal'`, because it "
+                "determines the latent index the action image is pinned at."
             )
 
         if input_image.ndim == 3:
@@ -1133,11 +1196,32 @@ class FastWAM(torch.nn.Module):
             if input_action_image.ndim == 3:
                 input_action_image = input_action_image.unsqueeze(0)
             input_action_image = input_action_image.to(device=self.device, dtype=self.torch_dtype)
-        conditioning_latents, _ = self._encode_conditioning_images(
-            input_image=input_image,
-            input_action_image=input_action_image,
-            tiled=tiled,
-        )
+        if mode == "segment_first_frame_causal":
+            # Separate generator so the action noise above stays bit-identical to
+            # the single-stream behaviour, mirroring `infer_joint`.
+            video_generator = (
+                None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+            )
+            _, _, latent_t = self._parse_video_frame_layout(int(num_video_frames))
+            conditioning_latents, _ = self._build_conditioning_latent_grid(
+                input_image=input_image,
+                input_action_image=input_action_image,
+                latent_t=latent_t,
+                generator=video_generator,
+                rand_device=rand_device,
+                tiled=tiled,
+            )
+        else:
+            # `first_frame_causal` needs no grid: its single pin is at temporal
+            # index 0 in training as well, and `build_video_to_video_mask` makes
+            # the first frame attend only to itself, so a bare 1-frame latent is
+            # exactly equivalent to the full training grid. Building the grid
+            # anyway would triple the prefill cost for an identical result.
+            conditioning_latents, _ = self._encode_conditioning_images(
+                input_image=input_image,
+                input_action_image=input_action_image,
+                tiled=tiled,
+            )
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -1169,8 +1253,19 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio,
             )
 
-        timestep_video = torch.zeros(
+        # Under `segment_first_frame_causal` the grid's non-pinned frames hold pure
+        # noise, so they must be declared at the fully-noisy end of the schedule
+        # rather than as clean. `pre_dit` overwrites the pinned frames' per-token
+        # timestep with 0, so the pins are still announced as clean. The
+        # single-pin mode has no filler frames, so it keeps its exact previous
+        # value and stays bit-identical.
+        timestep_video = torch.full(
             (conditioning_latents.shape[0],),
+            (
+                float(self.infer_video_scheduler.num_train_timesteps)
+                if mode == "segment_first_frame_causal"
+                else 0.0
+            ),
             dtype=conditioning_latents.dtype,
             device=self.device,
         )

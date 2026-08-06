@@ -62,7 +62,14 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
 echo "[sbatch] host=$(hostname) job=${SLURM_JOB_ID}"
 echo "[sbatch] nodes=${SLURM_NNODES} nodelist=${SLURM_JOB_NODELIST}"
 echo "[sbatch] gpus_per_node=${GPUS_PER_NODE} master=${MASTER_ADDR}:${MASTER_PORT} (host=${_MASTER_HOST})"
-printf -v _EXTRA_ARGS '%q ' "$@"
+# With no extra args, `printf '%q ' "$@"` expands "$@" to one empty word and emits
+# `'' `, which reaches hydra as a blank override and dies with
+# "mismatched input '<EOF>'". Earlier runs only worked because they were submitted
+# with `-- wandb.enabled=true`.
+_EXTRA_ARGS=""
+if (($#)); then
+  printf -v _EXTRA_ARGS '%q ' "$@"
+fi
 echo "[sbatch] task=${TASK} train_script=${TRAIN_SCRIPT}"
 echo "[sbatch] extra_args: $*"
 

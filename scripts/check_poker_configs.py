@@ -53,6 +53,58 @@ def check_data_configs_are_one_line_apart() -> None:
 check_data_configs_are_one_line_apart()
 
 
+def check_train_and_deploy_pin_the_same_latent_indices() -> None:
+    """The deploy pins must land on the training latent grid, not a smaller one.
+
+    3D RoPE encodes a token's latent frame index into its query/key, so a
+    conditioning frame pinned at a different index than it was trained at is read
+    by the action expert at a position it never saw. This shipped once: deploy
+    encoded the two conditioning stills into a bare `latent_t=2` grid, putting the
+    action image at temporal index 1 against training's 3. Closed-loop success
+    fell to 10.0% from the control's 66.0% while `loss_action` was 39.5% BETTER
+    than the control, so no offline metric could catch it. Assert the two agree.
+    """
+    from fastwam.datasets.robotwin.obs_utils import dual_segment_video_frames
+
+    print("\n=== train vs deploy conditioning pins ===")
+    for task in ARMS:
+        cfg = load(task)
+        mode = cfg.model.video_dit_config.video_attention_mask_mode
+        dual = mode == "segment_first_frame_causal"
+        num_frames = int(cfg.data.train.num_frames)
+        stride = int(cfg.data.train.action_video_freq_ratio)
+
+        # Training: the dataset's own video, encoded per VAE segment.
+        segment_frames, dual_frames = dual_segment_video_frames(num_frames, stride)
+        train_pixel_t = dual_frames if dual else segment_frames
+        train_latent_t = (train_pixel_t // 2 - 1) // VAE_TEMPORAL_FACTOR + 1
+        train_latent_t = 2 * train_latent_t if dual else (train_pixel_t - 1) // VAE_TEMPORAL_FACTOR + 1
+        train_pins = (0, train_latent_t // 2) if dual else (0,)
+
+        # Deploy: what deploy_policy.py passes as `num_video_frames`, run through
+        # the same `_parse_video_frame_layout` arithmetic infer_action uses.
+        deploy_pixel_t = dual_frames if dual else segment_frames
+        if deploy_pixel_t % VAE_TEMPORAL_FACTOR == 1:
+            deploy_latent_t = (deploy_pixel_t - 1) // VAE_TEMPORAL_FACTOR + 1
+        else:
+            deploy_latent_t = 2 * ((deploy_pixel_t // 2 - 1) // VAE_TEMPORAL_FACTOR + 1)
+        deploy_pins = (0, deploy_latent_t // 2) if dual else (0,)
+
+        print(
+            f"  {task}: train latent_t={train_latent_t} pins={train_pins} | "
+            f"deploy latent_t={deploy_latent_t} pins={deploy_pins}"
+        )
+        assert train_latent_t == deploy_latent_t, (
+            f"{task}: train latent_t={train_latent_t} but deploy builds "
+            f"{deploy_latent_t} -- conditioning RoPE positions will not match"
+        )
+        assert train_pins == deploy_pins, (
+            f"{task}: train pins {train_pins} but deploy pins {deploy_pins} -- "
+            "the conditioning frames carry the wrong RoPE temporal positions"
+        )
+    print("  OK: deploy pins the conditioning frames where training did")
+
+
 def load(task: str):
     with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
         return compose(config_name="train", overrides=[f"task={task}"])
@@ -115,3 +167,5 @@ for field in ("episodes", "windows", "action_shape", "effective_batch", "lr"):
     print(f"  {field:16s}: {control[field]} vs {treatment[field]}  {'OK' if same else 'MISMATCH'}")
     assert same, f"{field} differs between arms: {control[field]} vs {treatment[field]}"
 print("  both arms share the data pipeline; action image is the only variable")
+
+check_train_and_deploy_pin_the_same_latent_indices()

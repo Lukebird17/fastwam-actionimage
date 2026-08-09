@@ -248,3 +248,6 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+# ICLR 2027 reference PDFs are kept locally, not in git (too large).
+docs/iclr2027/papers/*.pdf

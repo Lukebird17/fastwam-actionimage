@@ -509,20 +509,31 @@ class WanVideoDiT(torch.nn.Module):
             first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
             video_mask[:first_frame_tokens, first_frame_tokens:] = False
             return video_mask
-        if self.video_attention_mask_mode == "segment_first_frame_causal":
+        if self.video_attention_mask_mode in (
+            "segment_first_frame_causal",
+            "segment_first_frame_bidirectional",
+        ):
             if video_seq_len % video_tokens_per_frame:
                 raise ValueError("Video sequence length must contain complete latent frames.")
             num_frames = video_seq_len // video_tokens_per_frame
             if num_frames % 2:
                 raise ValueError(
-                    "segment_first_frame_causal requires two equal latent segments, "
+                    f"{self.video_attention_mask_mode} requires two equal latent segments, "
                     f"got {num_frames} latent frames."
                 )
             video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-            for frame_index in (0, num_frames // 2):
-                start = frame_index * video_tokens_per_frame
-                end = start + video_tokens_per_frame
-                video_mask[start:end, end:] = False
+            if self.video_attention_mask_mode == "segment_first_frame_causal":
+                # Causally isolate each segment's pinned first frame: a pinned frame
+                # attends only to tokens up to and including itself, never to the
+                # noisy future frames that follow it.
+                for frame_index in (0, num_frames // 2):
+                    start = frame_index * video_tokens_per_frame
+                    end = start + video_tokens_per_frame
+                    video_mask[start:end, end:] = False
+            # `segment_first_frame_bidirectional`: leave the all-ones mask, so the
+            # pinned clean frame's hidden state can be polluted by the noisy future
+            # frames. This is the C2 condition-(c) "isolation off" ablation; every
+            # other aspect of the dual-segment layout is unchanged.
             return video_mask
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
@@ -564,10 +575,13 @@ class WanVideoDiT(torch.nn.Module):
                 dtype=timestep.dtype,
                 device=timestep.device,
             ) * timestep.view(batch_size, 1, 1)
-            if self.video_attention_mask_mode == "segment_first_frame_causal":
+            if self.video_attention_mask_mode in (
+                "segment_first_frame_causal",
+                "segment_first_frame_bidirectional",
+            ):
                 if x.shape[2] % 2:
                     raise ValueError(
-                        "segment_first_frame_causal requires two equal latent segments, "
+                        f"{self.video_attention_mask_mode} requires two equal latent segments, "
                         f"got {x.shape[2]} latent frames."
                     )
                 conditioning_indices = (0, x.shape[2] // 2)

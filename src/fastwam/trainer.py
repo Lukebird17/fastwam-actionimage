@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -15,6 +16,7 @@ from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
+from .models.wan22.fastwam import DUAL_SEGMENT_CONDITIONING_MODES
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
@@ -41,6 +43,15 @@ class Wan22Trainer:
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        save_total_limit = cfg.get("save_total_limit", 5)
+        if save_total_limit is None or str(save_total_limit).strip().lower() in {"", "none", "null"}:
+            self.save_total_limit = None
+        else:
+            self.save_total_limit = int(save_total_limit)
+            if self.save_total_limit < 0:
+                raise ValueError(f"`save_total_limit` must be >= 0 or null, got {save_total_limit}")
+            if self.save_total_limit == 0:
+                self.save_total_limit = None
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -413,7 +424,7 @@ class Wan22Trainer:
             num_frames % 2 == 0
             and (num_frames // 2) % 4 == 1
             and str(getattr(model.video_expert, "video_attention_mask_mode", ""))
-            == "segment_first_frame_causal"
+            in DUAL_SEGMENT_CONDITIONING_MODES
         )
         segment_frames = num_frames // 2 if is_dual_segment else num_frames
         input_image = video0[:, 0].unsqueeze(0)
@@ -628,6 +639,46 @@ class Wan22Trainer:
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
+    @staticmethod
+    def _checkpoint_step_key(path: Path) -> int | None:
+        match = re.search(r"step[_-](\d+)", path.stem if path.is_file() else path.name)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _prune_checkpoints(self) -> None:
+        """Keep only the newest ``save_total_limit`` weight files and state dirs.
+
+        The DeepSpeed optimizer state under ``state/`` is ~80G per checkpoint against
+        ~12G for the weights, so an unbounded run fills the /scratch quota and dies
+        mid-training. Prune both, keyed on the step number rather than mtime, so a
+        resumed run that rewrites an existing tag still orders correctly.
+        """
+        if self.save_total_limit is None or not self.accelerator.is_main_process:
+            return
+
+        weight_items = []
+        for path in Path(self.weights_dir).glob("step_*.pt"):
+            step = self._checkpoint_step_key(path)
+            if step is not None:
+                weight_items.append((step, path))
+        weight_items.sort(key=lambda item: item[0])
+        for _, path in weight_items[: max(0, len(weight_items) - self.save_total_limit)]:
+            path.unlink(missing_ok=True)
+            logger.info("[ckpt] pruned weights %s (save_total_limit=%d)", path, self.save_total_limit)
+
+        state_items = []
+        for path in Path(self.state_dir).iterdir():
+            if not path.is_dir():
+                continue
+            step = self._checkpoint_step_key(path)
+            if step is not None:
+                state_items.append((step, path))
+        state_items.sort(key=lambda item: item[0])
+        for _, path in state_items[: max(0, len(state_items) - self.save_total_limit)]:
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info("[ckpt] pruned state %s (save_total_limit=%d)", path, self.save_total_limit)
+
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
@@ -642,6 +693,7 @@ class Wan22Trainer:
         self.accelerator.save_state(output_dir=state_path)
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
+            self._prune_checkpoints()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}

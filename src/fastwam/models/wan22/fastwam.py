@@ -14,6 +14,18 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
 
+# Mask modes that lay the conditioning out as TWO equal latent segments
+# ([scene | action-image]) with a clean conditioning frame pinned at each segment's
+# first latent frame (indices (0, T//2)) and stamped t=0. The two differ ONLY in the
+# attention mask: `segment_first_frame_causal` causally isolates each pinned frame,
+# `segment_first_frame_bidirectional` lets every frame attend everywhere (the C2
+# condition-(c) "isolation off" ablation). Every dual-segment code path must treat
+# these identically so the ablation varies isolation and nothing else.
+DUAL_SEGMENT_CONDITIONING_MODES = (
+    "segment_first_frame_causal",
+    "segment_first_frame_bidirectional",
+)
+
 
 class FastWAM(torch.nn.Module):
     """MoT world model with video/action experts."""
@@ -278,10 +290,10 @@ class FastWAM(torch.nn.Module):
 
     def _conditioning_latent_indices(self, num_latent_frames: int) -> tuple[int, ...]:
         mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
-        if mode == "segment_first_frame_causal":
+        if mode in DUAL_SEGMENT_CONDITIONING_MODES:
             if num_latent_frames % 2:
                 raise ValueError(
-                    "segment_first_frame_causal requires two equal latent segments, "
+                    f"{mode} requires two equal latent segments, "
                     f"got {num_latent_frames} latent frames."
                 )
             return (0, num_latent_frames // 2)
@@ -323,11 +335,11 @@ class FastWAM(torch.nn.Module):
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
         scene_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
-        if mode != "segment_first_frame_causal":
+        if mode not in DUAL_SEGMENT_CONDITIONING_MODES:
             return scene_latents, (0,)
         if input_action_image is None:
             raise ValueError(
-                "`input_action_image` is required when `video_attention_mask_mode='segment_first_frame_causal'`."
+                f"`input_action_image` is required when `video_attention_mask_mode='{mode}'`."
             )
         action_latents = self._encode_input_image_latents_tensor(
             input_image=input_action_image, tiled=tiled
@@ -390,7 +402,7 @@ class FastWAM(torch.nn.Module):
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
-        if mode == "segment_first_frame_causal" and latents.shape[2] % 2 == 0:
+        if mode in DUAL_SEGMENT_CONDITIONING_MODES and latents.shape[2] % 2 == 0:
             decoded = [
                 self.vae.decode(
                     segment,
@@ -1147,15 +1159,16 @@ class FastWAM(torch.nn.Module):
         """
         self.eval()
         mode = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
-        if mode not in {"first_frame_causal", "segment_first_frame_causal"}:
+        if mode not in {"first_frame_causal", *DUAL_SEGMENT_CONDITIONING_MODES}:
             raise ValueError(
                 "`infer_action` requires `video_attention_mask_mode` in "
-                "{'first_frame_causal', 'segment_first_frame_causal'}."
+                "{'first_frame_causal', 'segment_first_frame_causal', "
+                "'segment_first_frame_bidirectional'}."
             )
-        if mode == "segment_first_frame_causal" and num_video_frames is None:
+        if mode in DUAL_SEGMENT_CONDITIONING_MODES and num_video_frames is None:
             raise ValueError(
                 "`num_video_frames` is required when "
-                "`video_attention_mask_mode='segment_first_frame_causal'`, because it "
+                f"`video_attention_mask_mode='{mode}'`, because it "
                 "determines the latent index the action image is pinned at."
             )
 
@@ -1196,7 +1209,7 @@ class FastWAM(torch.nn.Module):
             if input_action_image.ndim == 3:
                 input_action_image = input_action_image.unsqueeze(0)
             input_action_image = input_action_image.to(device=self.device, dtype=self.torch_dtype)
-        if mode == "segment_first_frame_causal":
+        if mode in DUAL_SEGMENT_CONDITIONING_MODES:
             # Separate generator so the action noise above stays bit-identical to
             # the single-stream behaviour, mirroring `infer_joint`.
             video_generator = (
@@ -1253,17 +1266,17 @@ class FastWAM(torch.nn.Module):
                 proprio=proprio,
             )
 
-        # Under `segment_first_frame_causal` the grid's non-pinned frames hold pure
-        # noise, so they must be declared at the fully-noisy end of the schedule
-        # rather than as clean. `pre_dit` overwrites the pinned frames' per-token
-        # timestep with 0, so the pins are still announced as clean. The
+        # Under the dual-segment conditioning modes the grid's non-pinned frames
+        # hold pure noise, so they must be declared at the fully-noisy end of the
+        # schedule rather than as clean. `pre_dit` overwrites the pinned frames'
+        # per-token timestep with 0, so the pins are still announced as clean. The
         # single-pin mode has no filler frames, so it keeps its exact previous
         # value and stays bit-identical.
         timestep_video = torch.full(
             (conditioning_latents.shape[0],),
             (
                 float(self.infer_video_scheduler.num_train_timesteps)
-                if mode == "segment_first_frame_causal"
+                if mode in DUAL_SEGMENT_CONDITIONING_MODES
                 else 0.0
             ),
             dtype=conditioning_latents.dtype,

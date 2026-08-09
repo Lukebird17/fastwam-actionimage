@@ -20,6 +20,10 @@ num_epochs: 1
 max_steps: null
 log_every: 10
 save_every: 100
+# Keep only the newest N checkpoints. Each one costs ~12G of weights plus ~80G of
+# DeepSpeed optimizer state, so an unbounded run exhausts the /scratch quota and
+# dies mid-training. Set to null to disable pruning.
+save_total_limit: 5
 eval_every: 50
 eval_num_inference_steps: 10
 

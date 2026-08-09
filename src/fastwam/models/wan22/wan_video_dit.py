@@ -334,6 +334,7 @@ class WanVideoDiT(torch.nn.Module):
         action_dim: int = 7,
         action_group_causal_mask_mode = "causal",
         video_attention_mask_mode: str = "bidirectional",
+        mark_clean_conditioning_frame: bool = True,
         use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
@@ -348,6 +349,11 @@ class WanVideoDiT(torch.nn.Module):
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
         self.video_attention_mask_mode = str(video_attention_mask_mode)
+        # Ablation knob (C2, condition b): whether to explicitly stamp the injected clean
+        # conditioning frame with per-token timestep t=0. Default True = the treatment.
+        # Setting False leaves the clean frame at the shared (noisy) timestep, which makes
+        # the modulation signal self-contradictory as sigma -> 1.
+        self.mark_clean_conditioning_frame = bool(mark_clean_conditioning_frame)
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -567,7 +573,8 @@ class WanVideoDiT(torch.nn.Module):
                 conditioning_indices = (0, x.shape[2] // 2)
             else:
                 conditioning_indices = (0,)
-            token_timesteps[:, conditioning_indices, :] = 0
+            if self.mark_clean_conditioning_frame:
+                token_timesteps[:, conditioning_indices, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
             token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
             t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)

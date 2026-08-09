@@ -14,9 +14,16 @@ model:
 lr_scheduler_type: cosine
 learning_rate: 1e-4
 num_epochs: 10
-max_steps: null
+# Cap the full-task run at 100k steps (~1.24 epoch over the 50-task mixture) so the
+# 24h-walltime resumption chain terminates instead of running the full 807960 steps
+# (~23.7 days). Verified safe to set on a resumed run: `accelerator.load_state`
+# restores the saved scheduler (T_max/milestones) wholesale, so changing max_steps
+# only moves the loop's stop point and never shifts the LR curve.
+max_steps: 100000
 log_every: 10
-save_every: 2500
+# ~0.39 step/s on 2x8, so a 24h walltime covers ~33.6k steps: 5000 lands 6 saves
+# inside one walltime (>= the 3 wanted) and `save_total_limit` prunes to 5.
+save_every: 5000
 eval_every: 2500
 
 gradient_accumulation_steps: 1

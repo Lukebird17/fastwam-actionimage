@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from fastwam.models.wan22.fastwam import DUAL_SEGMENT_CONDITIONING_MODES
 from fastwam.datasets.robotwin.conditioning import (
     denormalize_action_16d,
     format_robotwin_prompt,
@@ -176,7 +177,7 @@ class WorldActionRobotWinPolicy:
         mask_mode = str(
             getattr(self.model.video_expert, "video_attention_mask_mode", "first_frame_causal")
         )
-        self.include_action_image = mask_mode == "segment_first_frame_causal"
+        self.include_action_image = mask_mode in DUAL_SEGMENT_CONDITIONING_MODES
         raw_num_frames = int(data_cfg.train.get("num_frames", 33))
         video_stride = int(data_cfg.train.get("action_video_freq_ratio", 4))
         segment_frames, dual_frames = dual_segment_video_frames(raw_num_frames, video_stride)

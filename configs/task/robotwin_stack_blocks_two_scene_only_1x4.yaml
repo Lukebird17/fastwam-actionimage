@@ -1,0 +1,48 @@
+# @package _global_
+#
+# Experiment (1): pure FastWAM on the stack_blocks_two task, 1 node x 4 GPUs.
+#
+# The control arm for the action-image comparison. Held identical to
+# `robotwin_poker_action_image_1x4.yaml` in EVERY respect except that the dataset
+# stops emitting the action-image half of the video (and the model therefore drops
+# `segment_first_frame_causal` and `lambda_action_image`, which are meaningless
+# without a second segment).
+#
+# Notably it uses the SAME `RoboTwinActionImageDataset` with
+# `include_action_video: false`, not the lerobot `RobotVideoDataset` of
+# `configs/data/robotwin.yaml`. That config would have changed the action space
+# (14D joint vs 16D end-effector) and the data source at the same time, leaving
+# no way to attribute a difference to the action image -- and its
+# `dataset_dirs: ./data/robotwin2.0/robotwin2.0` does not exist on this cluster.
+#
+# Effective batch is matched to the senior's 2x8 reference run:
+#   1 node x 4 GPUs x batch_size 8 x grad_accum 4 = 128 == 2 x 8 x 8 x 1.
+# So step counts are directly comparable to that run.
+defaults:
+  - override /data: robotwin_scene_only
+  - override /model: fastwam_scene_only
+  - _self_
+
+batch_size: 8
+num_workers: 8
+
+data:
+  train:
+    tasks: [stack_blocks_two]
+  val:
+    tasks: [stack_blocks_two]
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+lr_scheduler_type: cosine
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 2500
+
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null

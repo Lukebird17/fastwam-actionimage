@@ -38,17 +38,34 @@
 
 ## ③ 全任务（scaling 支撑）
 
-| 日期 | ckpt | 训练进度 | eval | 备注 |
+| 日期 | ckpt | 任务 | eval(50集) | 备注 |
 |---|---|---|---|---|
-| 2026-08-07 | step_017500 | 2.2%（欠训） | 0.44 (22/50) | 不可直接比 |
-| 2026-08-09 | step_125000 | ~1.5 epoch | 待测 | 作业 313725 TIMEOUT(24h)；已超 max_steps=100000，建议不再续训 |
+| 2026-08-07 | step_017500 | poker | 0.44 (22/50) | 欠训(2.2%)，不可比 |
+| 2026-08-11 | step_147500 | **poker** | **0.98** | 🔥 超单任务②(0.85)！多任务正迁移信号 |
+| 2026-08-11 | step_147500 | stack_blocks_two | 0.08 | 崩，该任务对全任务模型极难 |
+| 2026-08-11 | step_147500 | place_empty_cup | FAILED→待重测 | 文本缓存缺 prompt，已补(365917) |
+
+> **重要发现（2026-08-11）**：③ 全任务在 poker 上 0.98，**超过**单任务②的 0.85 ——
+> 多任务协同训练不但没掉点，反而在 poker 上有**正迁移**。这可以升级成 C3 的卖点：
+> "action image 表示在多任务 regime 不仅有效，还能带来跨任务正迁移"。
+> 注意 ③ 已被学长重组为 `..._deprecated_1x8` 目录，但仍在续训（step_147500, 8-11）。
+
+## 主表扩任务（C1 非单任务侥幸的证明）
+
+| 任务 | ① scene_only | ② action_image | 状态 |
+|---|---|---|---|
+| poker (基准) | 0.74 | 0.85 (p=0.035) | ✅ 已显著 |
+| place_empty_cup | step_005970 | step_005970 | 🔄 100集 eval 中 (365905/365906) |
+| place_can_basket | 训练中 (365979) | 训练中 (365980) | ⏳ 训练排队 |
+| ~~stack_blocks_two~~ | step_007500(欠训) | step_012030 | ❌ 弃用：③ 仅 0.08、①欠训，判别力差 |
 
 ## 待办（按 PROJECT_DESIGN §3 优先级）
 
-- [x] P0: ②vs① 上 100 episode —— 已挂（job 328661 ① / 328662 ②），RUNNING
-- [ ] P1: GeoProp baseline 训练臂 —— 降为 P1（①已含同源 proprio，主对比公平）
-- [x] P0: t=0 消融 —— 已挂（job 328712）
-- [x] P0: isolation 消融 —— 已实现 `segment_first_frame_bidirectional` 干净单变量，挂训练中
-- [ ] P1: ③ step_125000 重测
+- [x] P0: ②vs① 上 100 episode（poker 0.85 vs 0.74, p=0.035 显著）
+- [~] P0: 主表扩任务 —— place_empty_cup eval 中；place_can_basket 训练中；stack_blocks_two 弃用
+- [ ] P1: GeoProp baseline 训练臂（①已含同源 proprio，主对比公平，降为 P1）
+- [x] P0: t=0 消融（off 0.88 ≈ on 0.84, 非必要）
+- [x] P0: isolation 消融（off 0.78 vs on 0.84, p=0.58；100集 0.83 ≈ on, 非关键）
+- [ ] P1: ③ place_empty_cup 重测（缓存已补）
 - [ ] P1: attention map 可解释性图
 - [ ] P2: 视角泛化

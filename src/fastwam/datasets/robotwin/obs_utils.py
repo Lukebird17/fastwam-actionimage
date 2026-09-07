@@ -219,6 +219,7 @@ def build_closed_loop_visuals(
     geometry: ActionImageGeometry,
     render_cfg: ActionImageRenderConfig,
     include_action_image: bool,
+    blank_action_conditioning: bool = False,
 ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor | None]:
     """Pack proprio + RGB (+ optional action-image) exactly as closed-loop infer expects.
 
@@ -237,10 +238,13 @@ def build_closed_loop_visuals(
     input_image = compose_robotwin_rgb_tensor(observation)
     input_action_image = None
     if include_action_image:
-        input_action_image = render_action_image_tensor(
-            observation,
-            action_16d,
-            geometry=geometry,
-            render_cfg=render_cfg,
-        )
+        if blank_action_conditioning:
+            input_action_image = torch.full_like(input_image, -1.0)
+        else:
+            input_action_image = render_action_image_tensor(
+                observation,
+                action_16d,
+                geometry=geometry,
+                render_cfg=render_cfg,
+            )
     return action_16d, input_image, input_action_image

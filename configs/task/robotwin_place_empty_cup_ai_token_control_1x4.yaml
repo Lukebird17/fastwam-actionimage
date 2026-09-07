@@ -1,0 +1,31 @@
+# @package _global_
+# Token-matched control: blank current action-image frame and no future
+# action-image loss. This controls for the extra segment and compute.
+defaults:
+  - override /data: robotwin_action_image
+  - override /model: fastwam_action_image
+  - _self_
+
+batch_size: 8
+num_workers: 8
+data:
+  train:
+    tasks: [place_empty_cup]
+    blank_action_conditioning: true
+  val:
+    tasks: [place_empty_cup]
+    blank_action_conditioning: true
+model:
+  mot_checkpoint_mixed_attn: false
+  loss:
+    lambda_action_image: 0.0
+lr_scheduler_type: cosine
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 2500
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null

@@ -34,6 +34,7 @@ train:
   # fastwam.datasets.robotwin.wrist_mounts.
   geometry_embodiment: aloha-agilex
   include_action_video: false
+  blank_action_conditioning: false
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
   context_len: 128
@@ -63,6 +64,7 @@ val:
   wrist_look_distance: 0.25
   geometry_embodiment: aloha-agilex
   include_action_video: false
+  blank_action_conditioning: false
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
   context_len: 128

@@ -22,6 +22,7 @@ train:
   # Single source of truth: per-side wrist/action transforms live in
   # fastwam.datasets.robotwin.wrist_mounts.
   geometry_embodiment: aloha-agilex
+  blank_action_conditioning: false
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
   context_len: 128
@@ -50,6 +51,7 @@ val:
   action_sigma: 0.05
   wrist_look_distance: 0.25
   geometry_embodiment: aloha-agilex
+  blank_action_conditioning: false
   normalization_stats: ./data/RoboTwin2.0/aloha_action_16d_stats.json
   text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_action_image
   context_len: 128

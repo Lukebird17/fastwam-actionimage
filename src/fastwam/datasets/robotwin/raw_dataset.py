@@ -86,6 +86,7 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
         wrist_cam_from_ee: dict | None = None,
         ee_from_action_frame: dict | None = None,
         include_action_video: bool = True,
+        blank_action_conditioning: bool = False,
         return_video_components: bool = False,
         normalization_stats: str | Path | None = None,
         pretrained_norm_stats: str | Path | None = None,
@@ -124,6 +125,7 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
         # space (14D joint) and the data source at the same time as removing the
         # action image, so nothing could be attributed to the action image itself.
         self.include_action_video = include_action_video
+        self.blank_action_conditioning = bool(blank_action_conditioning)
         self.return_video_components = return_video_components
         self.text_embedding_cache_dir = (
             None if text_embedding_cache_dir is None else Path(text_embedding_cache_dir).expanduser()
@@ -273,6 +275,11 @@ class RoboTwinActionImageDataset(torch.utils.data.Dataset):
         action_video = None
         if self.include_action_video:
             action_video = compose_robotwin_views(torch.stack(action_views)).float()
+            # Keep the future target and token layout intact while removing only
+            # the current action-image condition for the 2x2 factorial ablation.
+            # Action images use a black [0, 1] background, mapped to -1 below.
+            if self.blank_action_conditioning:
+                action_video[0].zero_()
             action_video = action_video.mul(2).sub(1).permute(1, 0, 2, 3)
             video = torch.cat((scene_video, action_video), dim=1)
         else:

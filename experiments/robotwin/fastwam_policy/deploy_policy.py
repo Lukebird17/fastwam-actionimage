@@ -178,6 +178,9 @@ class WorldActionRobotWinPolicy:
             getattr(self.model.video_expert, "video_attention_mask_mode", "first_frame_causal")
         )
         self.include_action_image = mask_mode in DUAL_SEGMENT_CONDITIONING_MODES
+        self.blank_action_conditioning = bool(
+            data_cfg.train.get("blank_action_conditioning", False)
+        )
         raw_num_frames = int(data_cfg.train.get("num_frames", 33))
         video_stride = int(data_cfg.train.get("action_video_freq_ratio", 4))
         segment_frames, dual_frames = dual_segment_video_frames(raw_num_frames, video_stride)
@@ -199,11 +202,12 @@ class WorldActionRobotWinPolicy:
 
         logger.info(
             "Initialized RoboTwin policy | ckpt=%s | stats=%s | mask=%s | "
-            "action_image=%s | horizon=%d | replan=%d | video_frames=%d",
+            "action_image=%s | blank_action_conditioning=%s | horizon=%d | replan=%d | video_frames=%d",
             checkpoint_path,
             dataset_stats_path,
             mask_mode,
             self.include_action_image,
+            self.blank_action_conditioning,
             self.action_horizon,
             self.replan_steps,
             self.num_video_frames,
@@ -224,6 +228,7 @@ class WorldActionRobotWinPolicy:
             geometry=self.geometry,
             render_cfg=self.render_cfg,
             include_action_image=self.include_action_image,
+            blank_action_conditioning=self.blank_action_conditioning,
         )
         proprio = normalize_action_16d(action_16d, self.action_mean, self.action_std)
         prompt = format_robotwin_prompt(instruction)
